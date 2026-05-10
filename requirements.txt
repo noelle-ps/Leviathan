@@ -1,0 +1,7 @@
+discord.py
+flask
+groq
+aiohttp
+python-docx
+openpyxl
+reportlab
