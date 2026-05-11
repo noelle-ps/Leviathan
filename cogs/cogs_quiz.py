@@ -1051,6 +1051,174 @@ class QuizCog(commands.Cog):
         )
         await i.response.send_message(embed=e)
 
+    # ── /quiz search ───────────────────────────────────────────────────────────
+
+    @quiz.command(name="search", description="Search questions by keyword with optional filters (owner only)")
+    @app_commands.describe(
+        keyword="Word or phrase to search for in the question text",
+        category="Filter by category (optional)",
+        kind="Filter by question type (optional)",
+        points="Filter by point value (optional)",
+    )
+    @app_commands.choices(
+        kind=[
+            app_commands.Choice(name="Multiple Choice", value="mc"),
+            app_commands.Choice(name="Typed Answer",    value="typed"),
+        ],
+        points=[
+            app_commands.Choice(name="1 pt (normal)", value=1),
+            app_commands.Choice(name="2 pts (hard)",  value=2),
+        ],
+    )
+    @app_commands.autocomplete(category=category_autocomplete)
+    async def quiz_search(
+        self, i: discord.Interaction,
+        keyword: str,
+        category: str | None = None,
+        kind: str | None = None,
+        points: int | None = None,
+    ):
+        if not self._is_owner(i):
+            return await i.response.send_message("❌ Owner only.", ephemeral=True)
+
+        data = _load_q()
+        results = []
+
+        cats = [category.lower()] if category else list(data.keys())
+        kw   = keyword.lower()
+
+        for cat in cats:
+            for q in data.get(cat, []):
+                if kw not in q.get("question", "").lower():
+                    continue
+                if kind and _q_type(q) != kind:
+                    continue
+                if points and _q_points(q) != points:
+                    continue
+                results.append((cat, q))
+
+        if not results:
+            filters = []
+            if category: filters.append(f"category={category}")
+            if kind:     filters.append(f"type={kind}")
+            if points:   filters.append(f"pts={points}")
+            suffix = f" with filters ({', '.join(filters)})" if filters else ""
+            return await i.response.send_message(
+                f"❌ No questions matching **\"{keyword}\"**{suffix}.", ephemeral=True)
+
+        def _build_entries():
+            lines = []
+            for cat, q in results:
+                pts  = _q_points(q)
+                star = "🔥" if pts == 2 else "\u2003"
+                if _q_type(q) == "mc":
+                    lines.append(
+                        f"{star}**#{q['id']}** `{cat}` [{pts}pt] {q['question']}  *(Ans: {q.get('answer','?')})*")
+                else:
+                    preview = "; ".join(q.get("answers", [])[:2])
+                    lines.append(
+                        f"{star}**#{q['id']}** `{cat}` [{pts}pt] ✏️ {q['question']}  *(Typed: {preview})*")
+            return lines
+
+        filter_parts = []
+        if category: filter_parts.append(f"cat={category}")
+        if kind:     filter_parts.append(f"type={kind}")
+        if points:   filter_parts.append(f"pts={points}")
+        filter_str = f"  •  Filters: {', '.join(filter_parts)}" if filter_parts else ""
+
+        entries = _build_entries()
+
+        class SearchPaginator(discord.ui.View):
+            def __init__(self_, per_page: int = 15):
+                super().__init__(timeout=120)
+                self_.entries   = entries
+                self_.per_page  = per_page
+                self_.page      = 0
+                self_._update()
+
+            def _total(self_):
+                return max(1, (len(self_.entries) + self_.per_page - 1) // self_.per_page)
+
+            def _embed(self_):
+                start = self_.page * self_.per_page
+                chunk = self_.entries[start: start + self_.per_page]
+                e = discord.Embed(
+                    title=f"🔍 Search: \"{keyword}\"  — {len(results)} result(s)",
+                    description="\n".join(chunk),
+                    color=discord.Color.teal(),
+                )
+                e.set_footer(text=f"Page {self_.page+1}/{self_._total()}{filter_str}  •  🔥=2pt  ✏️=typed")
+                return e
+
+            def _update(self_):
+                self_.prev_btn.disabled = self_.page == 0
+                self_.next_btn.disabled = self_.page >= self_._total() - 1
+
+            @discord.ui.button(label="⬅️ Prev", style=discord.ButtonStyle.secondary)
+            async def prev_btn(self_, interaction: discord.Interaction, button: discord.ui.Button):
+                self_.page -= 1
+                self_._update()
+                await interaction.response.edit_message(embed=self_._embed(), view=self_)
+
+            @discord.ui.button(label="➡️ Next", style=discord.ButtonStyle.secondary)
+            async def next_btn(self_, interaction: discord.Interaction, button: discord.ui.Button):
+                self_.page += 1
+                self_._update()
+                await interaction.response.edit_message(embed=self_._embed(), view=self_)
+
+        view = SearchPaginator()
+        await i.response.send_message(embed=view._embed(), view=view, ephemeral=True)
+
+    # ── /quiz deletecategory ───────────────────────────────────────────────────
+
+    @quiz.command(name="deletecategory", description="Delete an entire category and all its questions (owner only)")
+    @app_commands.describe(category="Category to delete")
+    @app_commands.autocomplete(category=category_autocomplete)
+    async def quiz_deletecategory(self, i: discord.Interaction, category: str):
+        if not self._is_owner(i):
+            return await i.response.send_message("❌ Owner only.", ephemeral=True)
+
+        cat  = category.lower()
+        data = _load_q()
+
+        if cat not in data:
+            return await i.response.send_message(
+                f"❌ Category **{cat}** doesn't exist.", ephemeral=True)
+
+        count = len(data[cat])
+
+        class ConfirmDelete(discord.ui.View):
+            def __init__(self_):
+                super().__init__(timeout=30)
+                self_.confirmed = False
+
+            @discord.ui.button(label="🗑️ Yes, delete it", style=discord.ButtonStyle.danger)
+            async def confirm(self_, interaction: discord.Interaction, button: discord.ui.Button):
+                d = _load_q()
+                if cat in d:
+                    del d[cat]
+                    _save_q(d)
+                for child in self_.children:
+                    child.disabled = True
+                await interaction.response.edit_message(
+                    content=f"✅ Deleted category **{cat.title()}** and all **{count}** question(s).",
+                    view=self_)
+
+            @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+            async def cancel(self_, interaction: discord.Interaction, button: discord.ui.Button):
+                for child in self_.children:
+                    child.disabled = True
+                await interaction.response.edit_message(
+                    content="❌ Deletion cancelled.", view=self_)
+
+        view = ConfirmDelete()
+        await i.response.send_message(
+            f"⚠️ Are you sure you want to delete **{cat.title()}** and all **{count}** question(s) in it?\n"
+            f"This cannot be undone.",
+            view=view,
+            ephemeral=True,
+        )
+
     # ── /quiz leaderboard ──────────────────────────────────────────────────────
 
     @quiz.command(name="leaderboard", description="All-time quiz leaderboard")
