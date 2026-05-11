@@ -20,6 +20,70 @@ MODE_FIRST = "first"
 MODE_ZERO  = "zero"
 MODE_VS    = "vs"
 
+# ── autocomplete ───────────────────────────────────────────────────────────
+
+async def category_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    data = _load_q()
+    matches = [
+        app_commands.Choice(name=cat.title(), value=cat)
+        for cat in sorted(data.keys())
+        if current.lower() in cat.lower()
+    ]
+    return matches[:25]
+
+# ── quiz list paginator ────────────────────────────────────────────────────
+
+class QuizListPaginator(discord.ui.View):
+    def __init__(self, pool: list, cat: str, per_page: int = 20):
+        super().__init__(timeout=120)
+        self.pool     = pool
+        self.cat      = cat
+        self.per_page = per_page
+        self.page     = 0
+        self._update_buttons()
+
+    def total_pages(self) -> int:
+        return max(1, (len(self.pool) + self.per_page - 1) // self.per_page)
+
+    def build_embed(self) -> discord.Embed:
+        start = self.page * self.per_page
+        chunk = self.pool[start: start + self.per_page]
+        lines = []
+        for q in chunk:
+            pts  = _q_points(q)
+            star = "🔥" if pts == 2 else "\u2003"
+            if _q_type(q) == "mc":
+                lines.append(f"{star}**#{q['id']}** [{pts}pt] {q['question']}  *(Ans: {q.get('answer','?')})*")
+            else:
+                preview = "; ".join(q.get("answers", [])[:2])
+                lines.append(f"{star}**#{q['id']}** [{pts}pt] ✏️ {q['question']}  *(Typed: {preview})*")
+        e = discord.Embed(
+            title=f"📋 {self.cat.title()} — Page {self.page + 1}/{self.total_pages()}  ({len(self.pool)}/500)",
+            description="\n".join(lines),
+            color=discord.Color.blurple(),
+        )
+        e.set_footer(text="🔥 = 2 pts  •  ✏️ = typed answer  •  /quiz remove to delete")
+        return e
+
+    def _update_buttons(self):
+        self.prev_btn.disabled = self.page == 0
+        self.next_btn.disabled = self.page >= self.total_pages() - 1
+
+    @discord.ui.button(label="⬅️ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="➡️ Next", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
 # ── persistence ───────────────────────────────────────────────────────────
 
 def _load_q() -> dict:
@@ -539,6 +603,7 @@ class QuizCog(commands.Cog):
         app_commands.Choice(name="All to Answer",   value=MODE_ALL),
         app_commands.Choice(name="First to Answer", value=MODE_FIRST),
     ])
+    @app_commands.autocomplete(category=category_autocomplete)
     async def quiz_start(self, i: discord.Interaction, category: str, count: int = 10,
                          mode: str = MODE_ALL, timer: int = DEFAULT_TIMER):
         if not self._is_owner(i):
@@ -582,6 +647,7 @@ class QuizCog(commands.Cog):
         count="Questions per category (1–10, default 5)",
         timer="Seconds per question (default 20)",
     )
+    @app_commands.autocomplete(category1=category_autocomplete, category2=category_autocomplete)
     async def quiz_vs(self, i: discord.Interaction,
                       player1: discord.Member, category1: str,
                       player2: discord.Member, category2: str,
@@ -636,6 +702,7 @@ class QuizCog(commands.Cog):
         target="Starting point total — questions selected to sum to exactly this",
         timer="Seconds per question (default 20)",
     )
+    @app_commands.autocomplete(category=category_autocomplete)
     async def quiz_zero(self, i: discord.Interaction, player: discord.Member,
                         category: str, target: int = 20, timer: int = DEFAULT_TIMER):
         if not self._is_owner(i):
@@ -862,6 +929,7 @@ class QuizCog(commands.Cog):
         answer="Correct letter: A / B / C / D",
         points="1 = normal, 2 = hard/bonus (default 1)",
     )
+    @app_commands.autocomplete(category=category_autocomplete)
     async def quiz_add(self, i: discord.Interaction, category: str, question: str,
                        a: str, b: str, c: str, d: str, answer: str, points: int = 1):
         if not self._is_owner(i):
@@ -929,6 +997,7 @@ class QuizCog(commands.Cog):
 
     @quiz.command(name="remove", description="Remove a question by its ID (owner only)")
     @app_commands.describe(category="Category name", question_id="ID shown in /quiz list")
+    @app_commands.autocomplete(category=category_autocomplete)
     async def quiz_remove(self, i: discord.Interaction, category: str, question_id: int):
         if not self._is_owner(i):
             return await i.response.send_message("❌ Owner only.", ephemeral=True)
@@ -947,34 +1016,17 @@ class QuizCog(commands.Cog):
     # ── /quiz list ─────────────────────────────────────────────────────────────
 
     @quiz.command(name="list", description="View questions in a category with their IDs (owner only)")
-    @app_commands.describe(category="Category name", page="Page number (20 per page)")
-    async def quiz_list(self, i: discord.Interaction, category: str, page: int = 1):
+    @app_commands.describe(category="Category name")
+    @app_commands.autocomplete(category=category_autocomplete)
+    async def quiz_list(self, i: discord.Interaction, category: str):
         if not self._is_owner(i):
             return await i.response.send_message("❌ Owner only.", ephemeral=True)
         cat  = category.lower()
         pool = _load_q().get(cat, [])
         if not pool:
             return await i.response.send_message(f"❌ No questions in **{cat}**.", ephemeral=True)
-        per_page    = 20
-        total_pages = max(1, (len(pool) + per_page - 1) // per_page)
-        page        = max(1, min(page, total_pages))
-        chunk       = pool[(page - 1) * per_page: page * per_page]
-        lines = []
-        for q in chunk:
-            pts  = _q_points(q)
-            star = "🔥" if pts == 2 else "  "
-            if _q_type(q) == "mc":
-                lines.append(f"{star}**#{q['id']}** [{pts}pt] {q['question']}  *(Ans: {q.get('answer','?')})*")
-            else:
-                preview = "; ".join(q.get("answers", [])[:2])
-                lines.append(f"{star}**#{q['id']}** [{pts}pt] ✏️ {q['question']}  *(Typed: {preview})*")
-        e = discord.Embed(
-            title=f"📋 {cat.title()} — Page {page}/{total_pages}  ({len(pool)}/500)",
-            description="\n".join(lines),
-            color=discord.Color.blurple(),
-        )
-        e.set_footer(text="🔥 = 2 pts  •  ✏️ = typed answer  •  /quiz remove to delete")
-        await i.response.send_message(embed=e, ephemeral=True)
+        view = QuizListPaginator(pool, cat)
+        await i.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
 
     # ── /quiz categories ───────────────────────────────────────────────────────
 
