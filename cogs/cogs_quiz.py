@@ -753,10 +753,14 @@ class QuizCog(commands.Cog):
     @quiz.command(name="ai", description="AI-generated quiz on any topic (owner only)")
     @app_commands.describe(
         topic="Topic to generate questions about",
-        count="Number of questions (1–20)",
+        count="Number of questions (1–20, ignored in Road to Zero)",
         difficulty="Difficulty level",
         mode="Game mode",
         timer="Seconds per question (default 20)",
+        player="Solo player — required for Road to Zero",
+        target="Point target — required for Road to Zero",
+        player1="Player 1 — required for 1v1 VS",
+        player2="Player 2 — required for 1v1 VS",
     )
     @app_commands.choices(
         difficulty=[
@@ -768,20 +772,58 @@ class QuizCog(commands.Cog):
         mode=[
             app_commands.Choice(name="All to Answer",   value=MODE_ALL),
             app_commands.Choice(name="First to Answer", value=MODE_FIRST),
+            app_commands.Choice(name="Road to Zero",    value=MODE_ZERO),
+            app_commands.Choice(name="1v1 VS",          value=MODE_VS),
         ],
     )
-    async def quiz_ai(self, i: discord.Interaction, topic: str, count: int = 5,
-                      difficulty: str = "medium", mode: str = MODE_ALL,
-                      timer: int = DEFAULT_TIMER):
+    async def quiz_ai(
+        self, i: discord.Interaction,
+        topic: str,
+        mode: str = MODE_ALL,
+        difficulty: str = "medium",
+        timer: int = DEFAULT_TIMER,
+        count: int = 5,
+        player: discord.Member | None = None,
+        target: int = 20,
+        player1: discord.Member | None = None,
+        player2: discord.Member | None = None,
+    ):
         if not self._is_owner(i):
             return await i.response.send_message("❌ Owner only.", ephemeral=True)
         gid = i.guild_id
         if gid in self.sessions:
             return await i.response.send_message("❌ Quiz already running.", ephemeral=True)
-        count = max(1, min(20, count))
+
+        # ── mode-specific validation ───────────────────────────────────────────
+        if mode == MODE_ZERO:
+            if not player:
+                return await i.response.send_message(
+                    "❌ Road to Zero requires a **player** to be set.", ephemeral=True)
+            if target < 2:
+                return await i.response.send_message(
+                    "❌ Target must be at least 2.", ephemeral=True)
+        if mode == MODE_VS:
+            if not player1 or not player2:
+                return await i.response.send_message(
+                    "❌ 1v1 VS requires both **player1** and **player2** to be set.", ephemeral=True)
+            if player1.id == player2.id:
+                return await i.response.send_message(
+                    "❌ Player 1 and Player 2 must be different people.", ephemeral=True)
+
         timer = max(10, min(120, timer))
+
+        # ── figure out how many questions to generate ──────────────────────────
+        if mode == MODE_ZERO:
+            # generate enough to give _select_zero_questions a good pool
+            gen_count = max(target * 2, 20)
+        elif mode == MODE_VS:
+            gen_count = max(1, min(20, count)) * 2
+        else:
+            gen_count = max(1, min(20, count))
+
         await i.response.send_message(
-            f"🤖 Generating **{count}** {difficulty} questions about **{topic}**…")
+            f"🤖 Generating AI questions about **{topic}** ({difficulty}) for **{mode}** mode…")
+
         diff_guide = {
             "easy":       "very straightforward — a beginner would know these",
             "medium":     "moderate — requires some knowledge of the topic",
@@ -789,40 +831,118 @@ class QuizCog(commands.Cog):
             "impossible": "extremely obscure — only a true expert would know",
         }
         prompt = (
-            f"Generate exactly {count} multiple-choice quiz questions about: {topic}\n"
+            f"Generate exactly {gen_count} multiple-choice quiz questions about: {topic}\n"
             f"Difficulty: {difficulty} ({diff_guide.get(difficulty, '')})\n"
-            f"Assign points: easier questions within the set get 1 point, harder ones get 2 points.\n"
+            f"Mix of 1-point (easier) and 2-point (harder) questions, roughly half each.\n"
             f"Return ONLY a valid JSON array with no markdown or extra text.\n"
-            f'Each item must be: {{"question": "...", "a": "...", "b": "...", "c": "...", "d": "...", '
+            f'Each item: {{"question": "...", "a": "...", "b": "...", "c": "...", "d": "...", '
             f'"answer": "A"|"B"|"C"|"D", "points": 1|2}}'
         )
         try:
             resp = await self.groq.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=2000,
+                max_tokens=4000,
                 temperature=0.7,
             )
             raw = resp.choices[0].message.content.strip()
             raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.M).strip()
-            questions = json.loads(raw)
-            if not isinstance(questions, list) or not questions:
+            pool = json.loads(raw)
+            if not isinstance(pool, list) or not pool:
                 raise ValueError("Empty or invalid response")
-            for idx, q in enumerate(questions[:count]):
+            for idx, q in enumerate(pool):
                 q["id"]     = idx + 1
                 q["type"]   = "mc"
                 q["answer"] = q.get("answer", "A").upper()
                 q["points"] = max(1, min(2, int(q.get("points", 1))))
         except Exception as err:
             return await i.edit_original_response(content=f"❌ Generation failed: {err}")
+
+        cat_label = f"AI · {topic}"
+
+        # ── Road to Zero ───────────────────────────────────────────────────────
+        if mode == MODE_ZERO:
+            questions = _select_zero_questions(pool, target)
+            if questions is None:
+                return await i.edit_original_response(
+                    content=(
+                        f"❌ Couldn't select questions that sum to exactly **{target}** pts "
+                        f"from the AI pool. Try a different target or re-run."
+                    )
+                )
+            session = {
+                "guild_id":       gid,
+                "channel_id":     i.channel_id,
+                "category":       cat_label,
+                "mode":           MODE_ZERO,
+                "timer":          timer,
+                "count":          len(questions),
+                "questions":      questions,
+                "players":        {player.id},
+                "scores":         {player.id: 0},
+                "current_q":      0,
+                "answered":       set(),
+                "state":          "running",
+                "ended":          False,
+                "zero_target":    target,
+                "zero_remaining": target,
+            }
+            self.sessions[gid] = session
+            await i.edit_original_response(
+                content=(
+                    f"🎯 **AI Road to Zero** — {player.mention}\n"
+                    f"Topic: **{topic}** · Target: **{target} pts** · "
+                    f"{len(questions)} questions · {timer}s timer\n"
+                    f"Starting in **3 seconds**…"
+                )
+            )
+            await asyncio.sleep(3)
+            asyncio.create_task(self._run_session(session))
+            return
+
+        # ── 1v1 VS ────────────────────────────────────────────────────────────
+        if mode == MODE_VS:
+            half    = len(pool) // 2
+            q_list  = pool[:half] + pool[half:]
+            random.shuffle(q_list)
+            q_list  = q_list[:max(1, min(20, count)) * 2]
+            session = {
+                "guild_id":   gid,
+                "channel_id": i.channel_id,
+                "category":   cat_label,
+                "mode":       MODE_VS,
+                "timer":      timer,
+                "count":      len(q_list),
+                "questions":  q_list,
+                "players":    {player1.id, player2.id},
+                "scores":     {player1.id: 0, player2.id: 0},
+                "current_q":  0,
+                "answered":   set(),
+                "state":      "running",
+                "ended":      False,
+            }
+            self.sessions[gid] = session
+            await i.edit_original_response(
+                content=(
+                    f"⚔️ **AI 1v1 VS!** {player1.mention} vs {player2.mention}\n"
+                    f"Topic: **{topic}** · {len(q_list)} questions · {timer}s timer\n"
+                    f"Starting in **3 seconds**…"
+                )
+            )
+            await asyncio.sleep(3)
+            asyncio.create_task(self._run_session(session))
+            return
+
+        # ── All to Answer / First to Answer (lobby) ────────────────────────────
+        questions = pool[:gen_count]
         session = {
             "guild_id":   gid,
             "channel_id": i.channel_id,
-            "category":   f"AI · {topic}",
+            "category":   cat_label,
             "mode":       mode,
             "timer":      timer,
-            "count":      len(questions[:count]),
-            "questions":  questions[:count],
+            "count":      len(questions),
+            "questions":  questions,
             "players":    set(),
             "scores":     {},
             "current_q":  0,
