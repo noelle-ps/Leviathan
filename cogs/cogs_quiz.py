@@ -20,7 +20,7 @@ MODE_FIRST = "first"
 MODE_ZERO  = "zero"
 MODE_VS    = "vs"
 
-# ── persistence ────────────────────────────────────────────────────────────────
+# ── persistence ───────────────────────────────────────────────────────────
 
 def _load_q() -> dict:
     if os.path.exists(QUESTIONS_FILE):
@@ -69,7 +69,7 @@ def _select_zero_questions(pool: list, target: int) -> list | None:
             return selected
     return None
 
-# ── MC answer buttons ──────────────────────────────────────────────────────────
+# ── MC answer buttons ─────────────────────────────────────────────────────────
 
 class AnswerView(discord.ui.View):
     def __init__(self, session: dict, q: dict):
@@ -119,118 +119,104 @@ class AnswerView(discord.ui.View):
     async def btn_d(self, i: discord.Interaction, b: discord.ui.Button):
         await self._handle(i, "D")
 
-# ── bulk add modal ─────────────────────────────────────────────────────────────
+# ── parse questions from text ─────────────────────────────────────────────────
 
-class BulkAddModal(discord.ui.Modal, title="Bulk Add Quiz Questions"):
-    body = discord.ui.TextInput(
-        label="One question per line — /quiz guide for format",
-        style=discord.TextStyle.paragraph,
-        placeholder=(
-            "MC:    mc | Question | A | B | C | D | Answer | Category | Points\n"
-            "Typed: typed | Question | Ans1;Ans2 | Category | Points\n\n"
-            "mc | What is Luffy's power? | Rubber | Fire | Ice | Speed | A | anime | 1\n"
-            "typed | What country is Tokyo in? | Japan | general | 1"
-        ),
-        required=True,
-        max_length=4000,
-    )
+def _parse_questions_from_text(text: str) -> tuple[list, list]:
+    """Parse questions from text and return (questions, errors)."""
+    data = _load_q()
+    questions_added = []
+    errors = []
 
-    def __init__(self, cog: "QuizCog"):
-        super().__init__()
-        self.cog = cog
+    for idx, line in enumerate(text.strip().splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        qtype = parts[0].lower() if parts else ""
 
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        data         = _load_q()
-        added, errors = 0, []
-
-        for idx, line in enumerate(self.body.value.strip().splitlines(), 1):
-            line = line.strip()
-            if not line or line.startswith("#"):
+        if qtype == "mc":
+            if len(parts) != 9:
+                errors.append(f"Line {idx} (mc): need 9 fields, got {len(parts)}")
                 continue
-            parts = [p.strip() for p in line.split("|")]
-            qtype = parts[0].lower() if parts else ""
+            _, q_text, a, b, c, d, ans, cat, pts_s = parts
+            ans = ans.upper()
+            if ans not in ("A", "B", "C", "D"):
+                errors.append(f"Line {idx}: answer must be A/B/C/D, got '{ans}'")
+                continue
+            try:
+                pts = max(1, min(2, int(pts_s)))
+            except ValueError:
+                pts = 1
+            cat = cat.lower()
+            data.setdefault(cat, [])
+            if len(data[cat]) >= MAX_PER_CAT:
+                errors.append(f"Line {idx}: '{cat}' is full (500 max)")
+                continue
+            qid = _next_id(data[cat])
+            question = {
+                "id": qid, "type": "mc",
+                "question": q_text,
+                "a": a, "b": b, "c": c, "d": d,
+                "answer": ans, "category": cat, "points": pts,
+            }
+            data[cat].append(question)
+            questions_added.append((cat, qid))
 
-            if qtype == "mc":
-                if len(parts) != 9:
-                    errors.append(f"Line {idx} (mc): need 9 fields, got {len(parts)}")
-                    continue
-                _, q_text, a, b, c, d, ans, cat, pts_s = parts
-                ans = ans.upper()
-                if ans not in ("A", "B", "C", "D"):
-                    errors.append(f"Line {idx}: answer must be A/B/C/D, got '{ans}'")
-                    continue
-                try:
-                    pts = max(1, min(2, int(pts_s)))
-                except ValueError:
-                    pts = 1
-                cat = cat.lower()
-                data.setdefault(cat, [])
-                if len(data[cat]) >= MAX_PER_CAT:
-                    errors.append(f"Line {idx}: '{cat}' is full (500 max)")
-                    continue
-                data[cat].append({
-                    "id": _next_id(data[cat]), "type": "mc",
-                    "question": q_text,
-                    "a": a, "b": b, "c": c, "d": d,
-                    "answer": ans, "category": cat, "points": pts,
-                })
-                added += 1
+        elif qtype == "typed":
+            if len(parts) != 5:
+                errors.append(f"Line {idx} (typed): need 5 fields, got {len(parts)}")
+                continue
+            _, q_text, answers_raw, cat, pts_s = parts
+            answers = [a.strip() for a in answers_raw.split(";") if a.strip()]
+            if not answers:
+                errors.append(f"Line {idx}: no answers provided")
+                continue
+            try:
+                pts = max(1, min(2, int(pts_s)))
+            except ValueError:
+                pts = 1
+            cat = cat.lower()
+            data.setdefault(cat, [])
+            if len(data[cat]) >= MAX_PER_CAT:
+                errors.append(f"Line {idx}: '{cat}' is full (500 max)")
+                continue
+            qid = _next_id(data[cat])
+            question = {
+                "id": qid, "type": "typed",
+                "question": q_text,
+                "answers": answers,
+                "category": cat, "points": pts,
+            }
+            data[cat].append(question)
+            questions_added.append((cat, qid))
 
-            elif qtype == "typed":
-                if len(parts) != 5:
-                    errors.append(f"Line {idx} (typed): need 5 fields, got {len(parts)}")
-                    continue
-                _, q_text, answers_raw, cat, pts_s = parts
-                answers = [a.strip() for a in answers_raw.split(";") if a.strip()]
-                if not answers:
-                    errors.append(f"Line {idx}: no answers provided")
-                    continue
-                try:
-                    pts = max(1, min(2, int(pts_s)))
-                except ValueError:
-                    pts = 1
-                cat = cat.lower()
-                data.setdefault(cat, [])
-                if len(data[cat]) >= MAX_PER_CAT:
-                    errors.append(f"Line {idx}: '{cat}' is full (500 max)")
-                    continue
-                data[cat].append({
-                    "id": _next_id(data[cat]), "type": "typed",
-                    "question": q_text,
-                    "answers": answers,
-                    "category": cat, "points": pts,
-                })
-                added += 1
+        elif len(parts) == 7:
+            # Backward-compat: old format with no type prefix
+            q_text, a, b, c, d, ans, cat = parts
+            ans = ans.upper()
+            if ans not in ("A", "B", "C", "D"):
+                errors.append(f"Line {idx}: answer must be A/B/C/D")
+                continue
+            cat = cat.lower()
+            data.setdefault(cat, [])
+            if len(data[cat]) >= MAX_PER_CAT:
+                errors.append(f"Line {idx}: '{cat}' is full")
+                continue
+            qid = _next_id(data[cat])
+            question = {
+                "id": qid, "type": "mc",
+                "question": q_text,
+                "a": a, "b": b, "c": c, "d": d,
+                "answer": ans, "category": cat, "points": 1,
+            }
+            data[cat].append(question)
+            questions_added.append((cat, qid))
 
-            elif len(parts) == 7:
-                # Backward-compat: old format with no type prefix
-                q_text, a, b, c, d, ans, cat = parts
-                ans = ans.upper()
-                if ans not in ("A", "B", "C", "D"):
-                    errors.append(f"Line {idx}: answer must be A/B/C/D")
-                    continue
-                cat = cat.lower()
-                data.setdefault(cat, [])
-                if len(data[cat]) >= MAX_PER_CAT:
-                    errors.append(f"Line {idx}: '{cat}' is full")
-                    continue
-                data[cat].append({
-                    "id": _next_id(data[cat]), "type": "mc",
-                    "question": q_text,
-                    "a": a, "b": b, "c": c, "d": d,
-                    "answer": ans, "category": cat, "points": 1,
-                })
-                added += 1
+        else:
+            errors.append(f"Line {idx}: unknown format — start with 'mc' or 'typed'")
 
-            else:
-                errors.append(f"Line {idx}: unknown format — start with 'mc' or 'typed'")
-
-        _save_q(data)
-        msg = f"✅ Added **{added}** question(s)."
-        if errors:
-            msg += "\n⚠️ Errors:\n" + "\n".join(errors[:8])
-        await interaction.followup.send(msg, ephemeral=True)
+    _save_q(data)
+    return questions_added, errors
 
 # ── cog ────────────────────────────────────────────────────────────────────────
 
@@ -816,7 +802,7 @@ class QuizCog(commands.Cog):
         await asyncio.sleep(3)
         asyncio.create_task(self._run_session(s))
 
-    # ── /quiz addplayer ────────────────────────────────────────────────────────
+    # ── /quiz addplayer ───────────────────────────────────────────────────────
 
     @quiz.command(name="addplayer", description="Add a player (works in lobby or mid-quiz) — owner only")
     @app_commands.describe(member="Member to add")
@@ -832,7 +818,7 @@ class QuizCog(commands.Cog):
         s["scores"][member.id] = 0
         await i.response.send_message(f"✅ **{member.display_name}** added to the quiz.")
 
-    # ── /quiz removeplayer ─────────────────────────────────────────────────────
+    # ── /quiz removeplayer ───────────────────────────────────────────────────���─
 
     @quiz.command(name="removeplayer", description="Remove a player (works in lobby or mid-quiz) — owner only")
     @app_commands.describe(member="Member to remove")
@@ -900,13 +886,44 @@ class QuizCog(commands.Cog):
         await i.response.send_message(
             f"✅ MC question **#{qid}** added to **{cat}** ({pts} pt).", ephemeral=True)
 
-    # ── /quiz bulkadd ──────────────────────────────────────────────────────────
+    # ── /quiz bulkadd (text file) ──────────────────────────────────────────────
 
-    @quiz.command(name="bulkadd", description="Paste many questions at once — run /quiz guide first (owner only)")
-    async def quiz_bulkadd(self, i: discord.Interaction):
+    @quiz.command(name="bulkadd", description="Add questions from a text file (owner only)")
+    async def quiz_bulkadd(self, i: discord.Interaction, file: discord.Attachment):
         if not self._is_owner(i):
             return await i.response.send_message("❌ Owner only.", ephemeral=True)
-        await i.response.send_modal(BulkAddModal(self))
+        
+        # Validate file type
+        if not file.filename.endswith(".txt"):
+            return await i.response.send_message("❌ Only .txt files are supported.", ephemeral=True)
+        
+        # Defer to avoid timeout
+        await i.response.defer(ephemeral=True)
+        
+        try:
+            # Download file content
+            content = await file.read()
+            text = content.decode("utf-8")
+        except Exception as e:
+            return await i.followup.send(f"❌ Failed to read file: {e}", ephemeral=True)
+        
+        # Parse questions in background to avoid timeout
+        try:
+            added, errors = _parse_questions_from_text(text)
+        except Exception as e:
+            return await i.followup.send(f"❌ Parsing error: {e}", ephemeral=True)
+        
+        # Build response message with proper formatting
+        msg = f"✅ Added **{len(added)}** question(s)."
+        
+        if errors:
+            msg += f"\n⚠️ Errors ({len(errors)}):\n"
+            for error in errors[:10]:
+                msg += f"• {error}\n"
+            if len(errors) > 10:
+                msg += f"• ... and {len(errors) - 10} more errors"
+        
+        await i.followup.send(msg, ephemeral=True)
 
     # ── /quiz remove ───────────────────────────────────────────────────────────
 
@@ -1004,7 +1021,7 @@ class QuizCog(commands.Cog):
         await i.response.send_message(embed=e)
 
 
-# ── setup ──────────────────────────────────────────────────────────────────────
+# ── setup ──────────────────────────────────────────────────────────────
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(QuizCog(bot))
