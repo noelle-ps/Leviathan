@@ -9,8 +9,6 @@ from utils.keep_alive import keep_alive
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-keep_alive()
-
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -48,6 +46,8 @@ async def main():
     if not token:
         logger.error("Bot token not found in Replit Secrets. Please set the 'TOKEN' environment variable.")
         raise Exception("Bot token not found in Replit Secrets.")
+
+    keep_alive(bot)
 
     try:
         await load_cogs()
