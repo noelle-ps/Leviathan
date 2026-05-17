@@ -1,7 +1,11 @@
 import discord
 from discord.ext import commands
 import datetime
+import os
+import aiohttp
 from utils.cmd_access import has_cmd_access
+
+RAILWAY_API = "https://backboard.railway.app/graphql/v2"
 
 
 class UtilityCog(commands.Cog):
@@ -86,6 +90,116 @@ class UtilityCog(commands.Cog):
             parts.append(f"{hours}h")
         parts.append(f"{minutes}m {seconds}s")
         await interaction.response.send_message(f"⏱️ Leviathan has been online for **{' '.join(parts)}**.")
+
+    # ── /railway ──────────────────────────────────────────────────────────────
+    @discord.app_commands.command(name="railway", description="Check Railway hosting usage, credits, and billing info.")
+    @has_mod_permissions()
+    async def railway(self, interaction: discord.Interaction):
+        token = os.getenv("RAILWAY_TOKEN")
+        if not token:
+            await interaction.response.send_message(
+                "❌ `RAILWAY_TOKEN` secret is not set. Add it in Replit Secrets to use this command.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        query = """
+        query {
+          me {
+            name
+            email
+            currentTeam {
+              id
+            }
+          }
+          subscriptions {
+            edges {
+              node {
+                customerId
+                status
+                couponId
+              }
+            }
+          }
+        }
+        """
+
+        usage_query = """
+        query UsageForProject($projectId: String!, $measurements: [MetricMeasurement!]!, $startDate: DateTime!, $endDate: DateTime!) {
+          usageForProject(
+            projectId: $projectId
+            measurements: $measurements
+            startDate: $startDate
+            endDate: $endDate
+            groupBy: []
+            sampleRateSeconds: 86400
+          ) {
+            measurement
+            values {
+              value
+            }
+          }
+        }
+        """
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    RAILWAY_API,
+                    json={"query": query},
+                    headers=headers,
+                ) as resp:
+                    data = await resp.json()
+
+                now = datetime.datetime.now(datetime.timezone.utc)
+                period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+                me = data.get("data", {}).get("me", {})
+                name = me.get("name") or "Unknown"
+                email = me.get("email") or "Unknown"
+
+                embed = discord.Embed(
+                    title="🚂 Railway Hosting Info",
+                    color=discord.Color(0x0B0D0E),
+                    timestamp=now,
+                )
+                embed.add_field(name="Account", value=name, inline=True)
+                embed.add_field(name="Email", value=email, inline=True)
+                embed.add_field(name="\u200b", value="\u200b", inline=True)
+
+                errors = data.get("errors")
+                if errors:
+                    embed.add_field(
+                        name="⚠️ API Error",
+                        value=f"```{errors[0].get('message', 'Unknown error')}```",
+                        inline=False,
+                    )
+                else:
+                    embed.add_field(
+                        name="📅 Billing Period",
+                        value=f"{period_start.strftime('%b %d')} → {now.strftime('%b %d, %Y')}",
+                        inline=False,
+                    )
+                    embed.add_field(
+                        name="ℹ️ Note",
+                        value="For detailed credit/usage breakdown, visit [railway.app/account/billing](https://railway.app/account/billing)",
+                        inline=False,
+                    )
+
+                embed.set_footer(text="Railway • Data fetched live")
+                await interaction.followup.send(embed=embed, ephemeral=True)
+
+        except aiohttp.ClientError as e:
+            await interaction.followup.send(f"❌ Failed to reach Railway API: `{e}`", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Unexpected error: `{e}`", ephemeral=True)
 
     async def cog_app_command_error(self, interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
         if isinstance(error, discord.app_commands.CheckFailure):
