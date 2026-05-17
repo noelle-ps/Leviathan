@@ -306,6 +306,8 @@ class EmbedCog(commands.Cog):
         footer="Custom footer text (defaults to your name)",
         footer_icon="URL for footer icon",
         footer_icon_file="Upload footer icon from your device",
+        image="URL for large bottom image",
+        image_file="Upload a large image from your device",
     )
     @discord.app_commands.choices(color=COLOR_CHOICES)
     @discord.app_commands.autocomplete(
@@ -313,6 +315,7 @@ class EmbedCog(commands.Cog):
         message=var_autocomplete,
         footer=var_autocomplete,
         footer_icon=url_var_autocomplete,
+        image=url_var_autocomplete,
     )
     async def embedannounce(
         self,
@@ -327,6 +330,8 @@ class EmbedCog(commands.Cog):
         footer: str | None = None,
         footer_icon: str | None = None,
         footer_icon_file: discord.Attachment | None = None,
+        image: str | None = None,
+        image_file: discord.Attachment | None = None,
     ):
         target = resolve_target(channel, interaction)
         if target is None:
@@ -335,11 +340,14 @@ class EmbedCog(commands.Cog):
 
         if footer_icon_file:
             footer_icon = footer_icon_file.url
+        if image_file:
+            image = image_file.url
 
         title       = apply_vars(interaction, title) or title
         message     = apply_vars(interaction, message) or message
         footer      = apply_vars(interaction, footer)
         footer_icon = apply_vars(interaction, footer_icon) or footer_icon
+        image       = apply_vars(interaction, image) or image
 
         message = message.replace("\\n", "\n")
         footer_text = footer or f"Announcement by {interaction.user.display_name}"
@@ -351,6 +359,7 @@ class EmbedCog(commands.Cog):
             color=resolve_color(color, hex_color),
             footer=footer_text,
             footer_icon=footer_icon_url,
+            image=image,
             timestamp=True,
         )
 
@@ -369,6 +378,7 @@ class EmbedCog(commands.Cog):
     @has_mod_permissions()
     @discord.app_commands.describe(
         rules="Rules separated by | (pipe). e.g. Be respectful|No spam|Follow Discord ToS",
+        title="Custom title (defaults to 'Server Rules')",
         channel="Channel to post rules in",
         color="Colour preset",
         hex_color="Custom hex colour",
@@ -385,6 +395,7 @@ class EmbedCog(commands.Cog):
         self,
         interaction: discord.Interaction,
         rules: str,
+        title: str | None = None,
         channel: discord.TextChannel | None = None,
         color: str = "red",
         hex_color: str | None = None,
@@ -405,6 +416,7 @@ class EmbedCog(commands.Cog):
         if footer_icon_file:
             footer_icon = footer_icon_file.url
 
+        title       = apply_vars(interaction, title) or title
         footer      = apply_vars(interaction, footer)
         footer_icon = apply_vars(interaction, footer_icon) or footer_icon
 
@@ -416,9 +428,10 @@ class EmbedCog(commands.Cog):
         formatted = "\n".join(f"**{i}.** {rule}" for i, rule in enumerate(rule_list, 1))
         footer_text = footer or f"{guild.name} • Please read and follow the rules"
         footer_icon_url = footer_icon or (guild.icon.url if guild.icon else None)
+        embed_title = f"📜 {title}" if title else "📜 Server Rules"
 
         embed = build_embed(
-            title="📜 Server Rules",
+            title=embed_title,
             description=formatted,
             color=resolve_color(color, hex_color),
             footer=footer_text,
