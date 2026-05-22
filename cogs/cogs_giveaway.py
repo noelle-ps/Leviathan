@@ -649,7 +649,7 @@ class GiveawayCog(commands.Cog):
                 title=f"🏆  You won — {data['title']}!",
                 description=(
                     f"🎉 **Congratulations!**\n\n"
-                    f"You have won **{prize['description']}** ({prize['name']}) "
+                    f"You have won **{prize['name']}** — {prize['description']} "
                     f"from **{data['title']}**.\n\n"
                     f"📩 Please message <@{data['hosted_by']}> to claim your reward!"
                 ),
@@ -668,6 +668,131 @@ class GiveawayCog(commands.Cog):
         if failed:
             parts.append(f"⚠️ Couldn't DM **{failed}** (DMs closed or blocked).")
         await interaction.followup.send(" ".join(parts), ephemeral=True)
+
+    @giveaway.command(name="edit", description="Edit an active giveaway's title, end time, or prizes")
+    @is_mod()
+    @discord.app_commands.describe(
+        giveaway_id="The giveaway ID shown in the embed footer",
+        title="New title (leave blank to keep current)",
+        extend="Extend the end time by this amount (e.g. 30m, 2h, 1d)",
+        prize1_name="Rename prize tier 1",
+        prize1_description="New description for prize tier 1",
+        prize2_name="Rename prize tier 2",
+        prize2_description="New description for prize tier 2",
+        prize3_name="Rename prize tier 3",
+        prize3_description="New description for prize tier 3",
+        footer_text="New footer text (supports {} vars)",
+        footer_icon="New footer icon URL (supports {} vars)",
+        image="New image URL (supports {} vars)",
+    )
+    async def giveaway_edit(
+        self,
+        interaction: discord.Interaction,
+        giveaway_id: str,
+        title: str | None = None,
+        extend: str | None = None,
+        prize1_name: str | None = None,
+        prize1_description: str | None = None,
+        prize2_name: str | None = None,
+        prize2_description: str | None = None,
+        prize3_name: str | None = None,
+        prize3_description: str | None = None,
+        footer_text: str | None = None,
+        footer_icon: str | None = None,
+        image: str | None = None,
+    ):
+        await interaction.response.defer(ephemeral=True)
+        giveaways = load_giveaways()
+
+        if giveaway_id not in giveaways:
+            await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
+            return
+
+        data = giveaways[giveaway_id]
+
+        if data.get("ended"):
+            await interaction.followup.send(
+                "❌ That giveaway has already ended and can't be edited.", ephemeral=True
+            )
+            return
+
+        changes: list[str] = []
+
+        if title:
+            data["title"] = title
+            changes.append(f"title → **{title}**")
+
+        if extend:
+            delta = parse_duration(extend)
+            if delta is None:
+                await interaction.followup.send(
+                    "❌ Invalid duration for extend. Use e.g. `30m`, `2h`, `1d`.", ephemeral=True
+                )
+                return
+            data["end_time"] = data["end_time"] + delta.total_seconds()
+            end_ts = int(data["end_time"])
+            changes.append(f"end time extended → <t:{end_ts}:f>")
+
+            # Reschedule the auto-end task
+            old_task = self.active_tasks.pop(giveaway_id, None)
+            if old_task:
+                old_task.cancel()
+            now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+            new_delay = max(0.0, data["end_time"] - now)
+            self.active_tasks[giveaway_id] = asyncio.create_task(
+                self._end_giveaway(giveaway_id, delay=new_delay)
+            )
+
+        prize_edits = [
+            (0, prize1_name, prize1_description),
+            (1, prize2_name, prize2_description),
+            (2, prize3_name, prize3_description),
+        ]
+        for idx, new_name, new_desc in prize_edits:
+            if idx >= len(data["prizes"]):
+                break
+            if new_name:
+                old = data["prizes"][idx]["name"]
+                data["prizes"][idx]["name"] = new_name
+                # Keep winners dict in sync if it exists
+                if old in data.get("winners", {}):
+                    data["winners"][new_name] = data["winners"].pop(old)
+                changes.append(f"prize {idx + 1} name → **{new_name}**")
+            if new_desc:
+                data["prizes"][idx]["description"] = new_desc
+                changes.append(f"prize {idx + 1} description → {new_desc}")
+
+        if footer_text is not None:
+            data["footer_text"] = _apply_vars(footer_text, interaction.guild, interaction.user)
+            changes.append("footer text updated")
+        if footer_icon is not None:
+            data["footer_icon"] = _apply_vars(footer_icon, interaction.guild, interaction.user)
+            changes.append("footer icon updated")
+        if image is not None:
+            data["image"] = _apply_vars(image, interaction.guild, interaction.user)
+            changes.append("image updated")
+
+        if not changes:
+            await interaction.followup.send("Nothing to update — provide at least one field.", ephemeral=True)
+            return
+
+        giveaways[giveaway_id] = data
+        save_giveaways(giveaways)
+
+        # Refresh the live embed in the channel
+        guild = self.bot.get_guild(data["guild_id"])
+        channel = guild.get_channel(data["channel_id"]) if guild else None
+        if channel and isinstance(channel, discord.TextChannel):
+            try:
+                message = await channel.fetch_message(data["message_id"])
+                await message.edit(embed=self._static_build_active_embed(data))
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+        summary = "\n".join(f"• {c}" for c in changes)
+        await interaction.followup.send(
+            f"✅ Giveaway updated:\n{summary}", ephemeral=True
+        )
 
     @giveaway.command(name="list", description="List all active giveaways in this server")
     @is_mod()
