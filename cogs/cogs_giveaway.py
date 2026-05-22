@@ -216,49 +216,38 @@ class GiveawayCog(commands.Cog):
         embed.timestamp = datetime.datetime.fromtimestamp(end_time, tz=datetime.timezone.utc)
         return embed
 
-    async def _build_prize_announce_embed(
-        self, data: dict, prize: dict, winners: list[str]
+    async def _build_winner_announce_embed(
+        self, data: dict, prize: dict, winner_id: str
     ) -> discord.Embed:
-        """Per-prize announcement embed. Sets first winner's avatar as thumbnail."""
+        """One embed per individual winner, with their own avatar as thumbnail."""
         embed = discord.Embed(
             color=discord.Color.gold(),
             timestamp=datetime.datetime.now(datetime.timezone.utc),
         )
-
-        if winners:
-            winner_mentions = ", ".join(f"<@{uid}>" for uid in winners)
-            embed.title = f"🏆  {prize['name']} Winner{'s' if len(winners) != 1 else ''}"
-            embed.description = (
-                f"🎉 **Congratulations, formatulations!**\n\n"
-                f"{winner_mentions} {'have' if len(winners) > 1 else 'has'} won "
-                f"**{prize['description']}** from **{data['title']}**.\n\n"
-                f"📩 Message the host for your reward!"
-            )
-            # Set first winner's avatar as thumbnail
-            try:
-                first_user = await self.bot.fetch_user(int(winners[0]))
-                embed.set_thumbnail(url=first_user.display_avatar.url)
-            except Exception:
-                pass
-        else:
-            embed.title = f"🏆  {prize['name']}"
-            embed.description = "*No eligible entries for this prize.*"
-
+        embed.title = f"🏆  {prize['name']}"
+        embed.description = (
+            f"🎉 **Congratulations, <@{winner_id}>!**\n\n"
+            f"You have won **{prize['description']}** from **{data['title']}**.\n\n"
+            f"📩 Message the host for your reward!"
+        )
+        try:
+            user = await self.bot.fetch_user(int(winner_id))
+            embed.set_thumbnail(url=user.display_avatar.url)
+        except Exception:
+            pass
         embed.set_footer(text=f"{data['title']}  •  ID: {data['giveaway_id']}")
         return embed
 
-    def _build_reroll_embed(self, data: dict, prize: dict, new_winners: list[int]) -> discord.Embed:
+    def _build_reroll_embed(self, data: dict, prize: dict, winner_id: int) -> discord.Embed:
         embed = discord.Embed(
             title=f"🔁  Reroll — {prize['name']}",
             color=discord.Color.blurple(),
             timestamp=datetime.datetime.now(datetime.timezone.utc),
         )
-        if new_winners:
-            winner_mentions = ", ".join(f"<@{uid}>" for uid in new_winners)
+        if winner_id:
             embed.description = (
-                f"🎉 **Congratulations, formatulations!**\n\n"
-                f"{winner_mentions} {'have' if len(new_winners) > 1 else 'has'} won "
-                f"**{prize['description']}** from **{data['title']}**.\n\n"
+                f"🎉 **Congratulations, <@{winner_id}>!**\n\n"
+                f"You have won **{prize['description']}** from **{data['title']}**.\n\n"
                 f"📩 Message the host for your reward!"
             )
         else:
@@ -497,17 +486,20 @@ class GiveawayCog(commands.Cog):
 
         await asyncio.sleep(5)
 
-        # One embed per prize tier, 5 sec apart, winner avatar as thumbnail
-        for idx, prize in enumerate(data["prizes"]):
-            prize_winners = winners.get(prize["name"], [])
-            embed = await self._build_prize_announce_embed(data, prize, prize_winners)
-            mention_str = " ".join(f"<@{uid}>" for uid in prize_winners)
-            await channel.send(
-                content=mention_str if mention_str else None,
-                embed=embed,
-            )
-            if idx < len(data["prizes"]) - 1:
-                await asyncio.sleep(5)
+        # Build flat list of (prize, winner_id) — one entry per individual winner
+        all_winners: list[tuple[dict, str]] = []
+        for prize in data["prizes"]:
+            for uid in winners.get(prize["name"], []):
+                all_winners.append((prize, uid))
+
+        if not all_winners:
+            await channel.send("*No eligible entries were found for this giveaway.*")
+        else:
+            for idx, (prize, uid) in enumerate(all_winners):
+                embed = await self._build_winner_announce_embed(data, prize, uid)
+                await channel.send(content=f"<@{uid}>", embed=embed)
+                if idx < len(all_winners) - 1:
+                    await asyncio.sleep(5)
 
         data["announced"] = True
         giveaways[giveaway_id] = data
@@ -610,11 +602,14 @@ class GiveawayCog(commands.Cog):
         guild = self.bot.get_guild(data["guild_id"])
         ch = guild.get_channel(data["channel_id"]) if guild else None
         if ch and isinstance(ch, discord.TextChannel):
-            mention_str = " ".join(f"<@{uid}>" for uid in new_winners)
-            await ch.send(
-                content=f"🔁 **Reroll!**" + (f"  {mention_str}" if mention_str else ""),
-                embed=self._build_reroll_embed(data, prize_obj, new_winners),
-            )
+            if new_winners:
+                for uid in new_winners:
+                    await ch.send(
+                        content=f"🔁 **Reroll!**  <@{uid}>",
+                        embed=self._build_reroll_embed(data, prize_obj, uid),
+                    )
+            else:
+                await ch.send(embed=self._build_reroll_embed(data, prize_obj, 0))
 
         await interaction.followup.send("✅ Reroll complete!", ephemeral=True)
 
