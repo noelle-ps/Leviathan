@@ -613,6 +613,62 @@ class GiveawayCog(commands.Cog):
 
         await interaction.followup.send("✅ Reroll complete!", ephemeral=True)
 
+    @giveaway.command(name="dm", description="DM every winner of a giveaway to contact the host for their reward")
+    @is_mod()
+    @discord.app_commands.describe(giveaway_id="The giveaway ID shown in the embed footer")
+    async def giveaway_dm(self, interaction: discord.Interaction, giveaway_id: str):
+        await interaction.response.defer(ephemeral=True)
+        giveaways = load_giveaways()
+
+        if giveaway_id not in giveaways:
+            await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
+            return
+
+        data = giveaways[giveaway_id]
+
+        if not data.get("ended"):
+            await interaction.followup.send(
+                "❌ That giveaway hasn't ended yet — no winners drawn yet.", ephemeral=True
+            )
+            return
+
+        winners = data.get("winners", {})
+        all_winner_ids: list[tuple[dict, str]] = []
+        for prize in data["prizes"]:
+            for uid in winners.get(prize["name"], []):
+                all_winner_ids.append((prize, uid))
+
+        if not all_winner_ids:
+            await interaction.followup.send("❌ No winners found for this giveaway.", ephemeral=True)
+            return
+
+        sent = 0
+        failed = 0
+        for prize, uid in all_winner_ids:
+            embed = discord.Embed(
+                title=f"🏆  You won — {data['title']}!",
+                description=(
+                    f"🎉 **Congratulations!**\n\n"
+                    f"You have won **{prize['description']}** ({prize['name']}) "
+                    f"from **{data['title']}**.\n\n"
+                    f"📩 Please message <@{data['hosted_by']}> to claim your reward!"
+                ),
+                color=discord.Color.gold(),
+                timestamp=datetime.datetime.now(datetime.timezone.utc),
+            )
+            embed.set_footer(text=f"Giveaway ID: {giveaway_id}")
+            try:
+                user = await self.bot.fetch_user(int(uid))
+                await user.send(embed=embed)
+                sent += 1
+            except (discord.Forbidden, discord.HTTPException):
+                failed += 1
+
+        parts = [f"✅ DMed **{sent}** winner{'s' if sent != 1 else ''}."]
+        if failed:
+            parts.append(f"⚠️ Couldn't DM **{failed}** (DMs closed or blocked).")
+        await interaction.followup.send(" ".join(parts), ephemeral=True)
+
     @giveaway.command(name="list", description="List all active giveaways in this server")
     @is_mod()
     async def giveaway_list(self, interaction: discord.Interaction):
