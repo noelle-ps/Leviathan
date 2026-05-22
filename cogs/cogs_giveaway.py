@@ -6,6 +6,7 @@ import json
 import os
 import random
 import logging
+from utils.embed_vars import resolve_vars
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,12 @@ def save_giveaways(data: dict):
     os.makedirs("data", exist_ok=True)
     with open(GIVEAWAYS_FILE, "w") as f:
         json.dump(data, f, indent=2)
+
+
+def _apply_vars(text: str | None, guild: discord.Guild | None, user: discord.Member | discord.User | None) -> str | None:
+    if not text:
+        return text
+    return resolve_vars(text, guild, user)
 
 
 # ── Persistent entry button ────────────────────────────────────────────────────
@@ -155,11 +162,7 @@ class GiveawayCog(commands.Cog):
             value=f"<t:{end_time}:R>  •  <t:{end_time}:f>",
             inline=False,
         )
-        embed.add_field(
-            name="👥 Entries",
-            value=str(len(data.get("entrants", []))),
-            inline=True,
-        )
+        embed.add_field(name="👥 Entries", value=str(len(data.get("entrants", []))), inline=True)
         embed.add_field(
             name="🏆 Total winners",
             value=str(sum(p["quantity"] for p in data["prizes"])),
@@ -171,7 +174,19 @@ class GiveawayCog(commands.Cog):
                 value=f"<@&{data['required_role']}>",
                 inline=True,
             )
-        embed.set_footer(text=f"Click the button to enter  •  ID: {data['giveaway_id']}")
+
+        # Custom footer — stored as already-resolved strings
+        footer_text = data.get("footer_text") or f"Click the button to enter  •  ID: {data['giveaway_id']}"
+        footer_icon = data.get("footer_icon") or None
+        if footer_icon:
+            embed.set_footer(text=footer_text, icon_url=footer_icon)
+        else:
+            embed.set_footer(text=footer_text)
+
+        # Custom image
+        if data.get("image"):
+            embed.set_image(url=data["image"])
+
         embed.timestamp = datetime.datetime.fromtimestamp(end_time, tz=datetime.timezone.utc)
         return embed
 
@@ -187,41 +202,52 @@ class GiveawayCog(commands.Cog):
             color=discord.Color.greyple(),
         )
         embed.add_field(name="Ended", value=f"<t:{end_time}:f>", inline=True)
-        embed.add_field(
-            name="Total entries",
-            value=str(len(data.get("entrants", []))),
-            inline=True,
-        )
-        embed.set_footer(text=f"Giveaway ended  •  ID: {data['giveaway_id']}")
+        embed.add_field(name="Total entries", value=str(len(data.get("entrants", []))), inline=True)
+
+        footer_icon = data.get("footer_icon") or None
+        if footer_icon:
+            embed.set_footer(text=f"Giveaway ended  •  ID: {data['giveaway_id']}", icon_url=footer_icon)
+        else:
+            embed.set_footer(text=f"Giveaway ended  •  ID: {data['giveaway_id']}")
+
+        if data.get("image"):
+            embed.set_image(url=data["image"])
+
         embed.timestamp = datetime.datetime.fromtimestamp(end_time, tz=datetime.timezone.utc)
         return embed
 
-    def _build_prize_announce_embed(
+    async def _build_prize_announce_embed(
         self, data: dict, prize: dict, winners: list[str]
     ) -> discord.Embed:
-        """Per-prize announcement embed with the congratulations format."""
+        """Per-prize announcement embed. Sets first winner's avatar as thumbnail."""
         embed = discord.Embed(
             color=discord.Color.gold(),
             timestamp=datetime.datetime.now(datetime.timezone.utc),
         )
+
         if winners:
             winner_mentions = ", ".join(f"<@{uid}>" for uid in winners)
+            embed.title = f"🏆  {prize['name']} Winner{'s' if len(winners) != 1 else ''}"
             embed.description = (
                 f"🎉 **Congratulations, formatulations!**\n\n"
                 f"{winner_mentions} {'have' if len(winners) > 1 else 'has'} won "
                 f"**{prize['description']}** from **{data['title']}**.\n\n"
                 f"📩 Message the host for your reward!"
             )
-            embed.title = f"🏆  {prize['name']} Winner{'s' if len(winners) != 1 else ''}"
+            # Set first winner's avatar as thumbnail
+            try:
+                first_user = await self.bot.fetch_user(int(winners[0]))
+                embed.set_thumbnail(url=first_user.display_avatar.url)
+            except Exception:
+                pass
         else:
             embed.title = f"🏆  {prize['name']}"
             embed.description = "*No eligible entries for this prize.*"
+
         embed.set_footer(text=f"{data['title']}  •  ID: {data['giveaway_id']}")
         return embed
 
-    def _build_reroll_embed(
-        self, data: dict, prize: dict, new_winners: list[int]
-    ) -> discord.Embed:
+    def _build_reroll_embed(self, data: dict, prize: dict, new_winners: list[int]) -> discord.Embed:
         embed = discord.Embed(
             title=f"🔁  Reroll — {prize['name']}",
             color=discord.Color.blurple(),
@@ -265,7 +291,6 @@ class GiveawayCog(commands.Cog):
             winners_by_prize[prize["name"]] = [str(uid) for uid in chosen]
             used.update(chosen)
 
-        # Edit original message — ended embed + disabled button (no extra message)
         if channel:
             try:
                 message = await channel.fetch_message(data["message_id"])
@@ -307,6 +332,9 @@ class GiveawayCog(commands.Cog):
         prize3_quantity="How many prize 3 winners (default 1)",
         channel="Channel to post in (defaults to current channel)",
         required_role="Role required to enter (optional)",
+        footer_text="Footer text — supports {server_name}, {date}, {user_name} etc.",
+        footer_icon="Footer icon URL — supports {server_icon}, {user_avatar} etc.",
+        image="Large image URL at the bottom — supports {server_icon}, {user_avatar} etc.",
     )
     async def giveaway_start(
         self,
@@ -324,14 +352,16 @@ class GiveawayCog(commands.Cog):
         prize3_quantity: int = 1,
         channel: discord.TextChannel | None = None,
         required_role: discord.Role | None = None,
+        footer_text: str | None = None,
+        footer_icon: str | None = None,
+        image: str | None = None,
     ):
         await interaction.response.defer(ephemeral=True)
 
         delta = parse_duration(duration)
         if delta is None:
             await interaction.followup.send(
-                "❌ Invalid duration. Use formats like `30s`, `10m`, `2h`, `1d`.",
-                ephemeral=True,
+                "❌ Invalid duration. Use formats like `30s`, `10m`, `2h`, `1d`.", ephemeral=True
             )
             return
 
@@ -341,9 +371,7 @@ class GiveawayCog(commands.Cog):
         elif isinstance(interaction.channel, discord.TextChannel):
             target = interaction.channel
         else:
-            await interaction.followup.send(
-                "❌ Use this command in a text channel.", ephemeral=True
-            )
+            await interaction.followup.send("❌ Use this command in a text channel.", ephemeral=True)
             return
 
         prizes = [
@@ -353,6 +381,11 @@ class GiveawayCog(commands.Cog):
             prizes.append({"name": prize2_name, "description": prize2_description, "quantity": max(1, prize2_quantity)})
         if prize3_name and prize3_description:
             prizes.append({"name": prize3_name, "description": prize3_description, "quantity": max(1, prize3_quantity)})
+
+        # Resolve {} variables at creation time using the command user's context
+        resolved_footer_text = _apply_vars(footer_text, interaction.guild, interaction.user)
+        resolved_footer_icon = _apply_vars(footer_icon, interaction.guild, interaction.user)
+        resolved_image = _apply_vars(image, interaction.guild, interaction.user)
 
         end_time = (datetime.datetime.now(datetime.timezone.utc) + delta).timestamp()
         data: dict = {
@@ -370,6 +403,9 @@ class GiveawayCog(commands.Cog):
             "ended": False,
             "announced": False,
             "winners": {},
+            "footer_text": resolved_footer_text,
+            "footer_icon": resolved_footer_icon,
+            "image": resolved_image,
         }
 
         message = await target.send(embed=self._static_build_active_embed(data))
@@ -418,7 +454,7 @@ class GiveawayCog(commands.Cog):
 
     @giveaway.command(
         name="announce",
-        description="Dramatically reveal winners — pings @everyone then sends each prize embed",
+        description="Dramatically reveal winners — pings @everyone then reveals each prize tier",
     )
     @is_mod()
     @discord.app_commands.describe(giveaway_id="The giveaway ID shown in the embed footer")
@@ -453,19 +489,18 @@ class GiveawayCog(commands.Cog):
 
         winners = data.get("winners", {})
 
-        # Step 1: Hype ping
+        # Hype ping
         await channel.send(
             "🎊 **@everyone — Giveaway winners are about to be announced!** 🥁 Get ready...",
             allowed_mentions=discord.AllowedMentions(everyone=True),
         )
 
-        # Step 2: Suspense
         await asyncio.sleep(5)
 
-        # Step 3: One embed per prize tier, 5 sec apart
+        # One embed per prize tier, 5 sec apart, winner avatar as thumbnail
         for idx, prize in enumerate(data["prizes"]):
             prize_winners = winners.get(prize["name"], [])
-            embed = self._build_prize_announce_embed(data, prize, prize_winners)
+            embed = await self._build_prize_announce_embed(data, prize, prize_winners)
             mention_str = " ".join(f"<@{uid}>" for uid in prize_winners)
             await channel.send(
                 content=mention_str if mention_str else None,
@@ -521,8 +556,7 @@ class GiveawayCog(commands.Cog):
         end_time = int(data["end_time"])
         embed.add_field(name="Ended", value=f"<t:{end_time}:f>", inline=True)
         embed.add_field(name="Total entries", value=str(len(data.get("entrants", []))), inline=True)
-        announced = "✅ Yes" if data.get("announced") else "⏳ Not yet"
-        embed.add_field(name="Announced", value=announced, inline=True)
+        embed.add_field(name="Announced", value="✅ Yes" if data.get("announced") else "⏳ Not yet", inline=True)
         embed.set_footer(text=f"Giveaway ID: {giveaway_id}  •  Only visible to you")
 
         await interaction.followup.send(embed=embed, ephemeral=True)
@@ -534,10 +568,7 @@ class GiveawayCog(commands.Cog):
         prize_name="Prize tier to reroll (e.g. Gold, Silver)",
     )
     async def giveaway_reroll(
-        self,
-        interaction: discord.Interaction,
-        giveaway_id: str,
-        prize_name: str,
+        self, interaction: discord.Interaction, giveaway_id: str, prize_name: str
     ):
         await interaction.response.defer(ephemeral=True)
         giveaways = load_giveaways()
