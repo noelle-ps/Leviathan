@@ -669,6 +669,47 @@ class GiveawayCog(commands.Cog):
             parts.append(f"⚠️ Couldn't DM **{failed}** (DMs closed or blocked).")
         await interaction.followup.send(" ".join(parts), ephemeral=True)
 
+    @giveaway.command(name="cancel", description="Cancel an active giveaway and delete the embed — no winners drawn")
+    @is_mod()
+    @discord.app_commands.describe(giveaway_id="The giveaway ID shown in the embed footer")
+    async def giveaway_cancel(self, interaction: discord.Interaction, giveaway_id: str):
+        await interaction.response.defer(ephemeral=True)
+        giveaways = load_giveaways()
+
+        if giveaway_id not in giveaways:
+            await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
+            return
+
+        data = giveaways[giveaway_id]
+
+        if data.get("ended"):
+            await interaction.followup.send(
+                "❌ That giveaway has already ended. Use `/giveaway reroll` if needed.", ephemeral=True
+            )
+            return
+
+        # Cancel the auto-end task
+        task = self.active_tasks.pop(giveaway_id, None)
+        if task:
+            task.cancel()
+
+        # Delete the embed message
+        guild = self.bot.get_guild(data["guild_id"])
+        channel = guild.get_channel(data["channel_id"]) if guild else None
+        if channel and isinstance(channel, discord.TextChannel):
+            try:
+                message = await channel.fetch_message(data["message_id"])
+                await message.delete()
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+        del giveaways[giveaway_id]
+        save_giveaways(giveaways)
+
+        await interaction.followup.send(
+            f"✅ Giveaway **{data['title']}** has been cancelled and the embed deleted.", ephemeral=True
+        )
+
     @giveaway.command(name="edit", description="Edit an active giveaway's title, end time, or prizes")
     @is_mod()
     @discord.app_commands.describe(
