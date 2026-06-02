@@ -882,6 +882,106 @@ class GiveawayCog(commands.Cog):
             overflow.set_footer(text=f"Page {idx}/{len(pages)}  •  ID: {giveaway_id}")
             await interaction.followup.send(embed=overflow, ephemeral=True)
 
+    @giveaway.command(name="restore", description="Manually restore a past giveaway with known winners — owner only")
+    @is_mod()
+    @discord.app_commands.describe(
+        giveaway_id="The original message ID of the giveaway",
+        title="Giveaway title",
+        prize1_name="First prize tier name",
+        prize1_description="First prize description",
+        prize1_winners="Winner IDs for prize 1, separated by spaces or commas",
+        prize2_name="Second prize tier name (optional)",
+        prize2_description="Second prize description (optional)",
+        prize2_winners="Winner IDs for prize 2, separated by spaces or commas",
+        prize3_name="Third prize tier name (optional)",
+        prize3_description="Third prize description (optional)",
+        prize3_winners="Winner IDs for prize 3, separated by spaces or commas",
+    )
+    async def giveaway_restore(
+        self,
+        interaction: discord.Interaction,
+        giveaway_id: str,
+        title: str,
+        prize1_name: str,
+        prize1_description: str,
+        prize1_winners: str,
+        prize2_name: str | None = None,
+        prize2_description: str | None = None,
+        prize2_winners: str | None = None,
+        prize3_name: str | None = None,
+        prize3_description: str | None = None,
+        prize3_winners: str | None = None,
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        def parse_ids(raw: str | None) -> list[str]:
+            if not raw:
+                return []
+            return [uid.strip().strip("<@>") for uid in raw.replace(",", " ").split() if uid.strip()]
+
+        prizes = []
+        winners: dict[str, list[str]] = {}
+        all_entrants: list[str] = []
+
+        for name, desc, raw_winners in [
+            (prize1_name, prize1_description, prize1_winners),
+            (prize2_name, prize2_description, prize2_winners),
+            (prize3_name, prize3_description, prize3_winners),
+        ]:
+            if not name or not desc:
+                continue
+            ids = parse_ids(raw_winners)
+            prizes.append({"name": name, "description": desc, "quantity": len(ids) or 1})
+            winners[name] = ids
+            all_entrants.extend(uid for uid in ids if uid not in all_entrants)
+
+        existing = await self.db_get(giveaway_id)
+        if existing:
+            await interaction.followup.send(
+                f"❌ A giveaway with ID `{giveaway_id}` already exists. Use `/giveaway editwinner` to change winners.",
+                ephemeral=True,
+            )
+            return
+
+        data: dict = {
+            "giveaway_id": giveaway_id,
+            "guild_id": interaction.guild.id,
+            "channel_id": interaction.channel.id,
+            "message_id": int(giveaway_id),
+            "title": title,
+            "prizes": prizes,
+            "end_time": datetime.datetime.now(datetime.timezone.utc).timestamp(),
+            "required_role": None,
+            "hosted_by": interaction.user.id,
+            "hosted_by_name": str(interaction.user),
+            "entrants": all_entrants,
+            "ended": True,
+            "announced": True,
+            "winners": winners,
+            "footer_text": None,
+            "footer_icon": None,
+            "image": None,
+        }
+
+        await self.db_set(giveaway_id, data)
+
+        # Build a summary embed to confirm what was saved
+        embed = discord.Embed(
+            title=f"✅  Restored — {title}",
+            color=discord.Color.green(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        )
+        for prize in prizes:
+            prize_winners = winners.get(prize["name"], [])
+            value = "\n".join(f"<@{uid}> (`{uid}`)" for uid in prize_winners) or "*none*"
+            embed.add_field(name=f"{prize['name']} — {prize['description']}", value=value, inline=False)
+        embed.set_footer(text=f"ID: {giveaway_id}  •  Only visible to you")
+        await interaction.followup.send(
+            "Giveaway restored. Use `/giveaway winners` or `/giveaway dm` with the ID below.",
+            embed=embed,
+            ephemeral=True,
+        )
+
     @giveaway.command(name="list", description="List all active giveaways in this server")
     @is_mod()
     async def giveaway_list(self, interaction: discord.Interaction):
