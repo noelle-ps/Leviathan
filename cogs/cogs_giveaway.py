@@ -930,6 +930,74 @@ class GiveawayCog(commands.Cog):
             f"✅ Giveaway updated:\n{summary}", ephemeral=True
         )
 
+    @giveaway.command(name="entrants", description="See everyone who entered a giveaway — ephemeral")
+    @is_mod()
+    @discord.app_commands.describe(
+        giveaway_id="The giveaway ID shown in the embed footer",
+        search="Check if a specific user ID is in the pool",
+    )
+    async def giveaway_entrants(
+        self,
+        interaction: discord.Interaction,
+        giveaway_id: str,
+        search: str | None = None,
+    ):
+        await interaction.response.defer(ephemeral=True)
+        giveaways = load_giveaways()
+
+        if giveaway_id not in giveaways:
+            await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
+            return
+
+        data = giveaways[giveaway_id]
+        entrants: list[str] = data.get("entrants", [])
+
+        # Search mode — just check if one person is in
+        if search:
+            if search in entrants:
+                await interaction.followup.send(
+                    f"✅ `{search}` (<@{search}>) **is** in the entrant pool.", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"❌ `{search}` is **not** in the entrant pool.", ephemeral=True
+                )
+            return
+
+        total = len(entrants)
+        if total == 0:
+            await interaction.followup.send("No one has entered this giveaway yet.", ephemeral=True)
+            return
+
+        # Split into pages of 50 mentions to stay under Discord's 4096 char embed limit
+        page_size = 50
+        pages: list[str] = []
+        for i in range(0, total, page_size):
+            chunk = entrants[i : i + page_size]
+            pages.append(" ".join(f"<@{uid}>" for uid in chunk))
+
+        embed = discord.Embed(
+            title=f"👥  Entrants — {data['title']}",
+            description=pages[0],
+            color=discord.Color.blurple(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc),
+        )
+        embed.set_footer(
+            text=f"Total: {total} entr{'y' if total == 1 else 'ies'}"
+            + (f"  •  Page 1/{len(pages)}" if len(pages) > 1 else "")
+            + f"  •  ID: {giveaway_id}"
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+        # Send overflow pages as follow-up embeds (still ephemeral)
+        for idx, page in enumerate(pages[1:], start=2):
+            overflow = discord.Embed(
+                description=page,
+                color=discord.Color.blurple(),
+            )
+            overflow.set_footer(text=f"Page {idx}/{len(pages)}  •  ID: {giveaway_id}")
+            await interaction.followup.send(embed=overflow, ephemeral=True)
+
     @giveaway.command(name="list", description="List all active giveaways in this server")
     @is_mod()
     async def giveaway_list(self, interaction: discord.Interaction):
