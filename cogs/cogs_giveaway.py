@@ -669,6 +669,101 @@ class GiveawayCog(commands.Cog):
             parts.append(f"⚠️ Couldn't DM **{failed}** (DMs closed or blocked).")
         await interaction.followup.send(" ".join(parts), ephemeral=True)
 
+    @giveaway.command(name="editwinner", description="Quietly swap or remove a winner without any public announcement")
+    @is_mod()
+    @discord.app_commands.describe(
+        giveaway_id="The giveaway ID shown in the embed footer",
+        prize_name="Prize tier the winner is in (e.g. Gold, Silver)",
+        remove="User ID of the winner to remove",
+        replace_with="User ID to put in their place — leave blank to auto-draw from remaining entrants",
+    )
+    async def giveaway_editwinner(
+        self,
+        interaction: discord.Interaction,
+        giveaway_id: str,
+        prize_name: str,
+        remove: str,
+        replace_with: str | None = None,
+    ):
+        await interaction.response.defer(ephemeral=True)
+        giveaways = load_giveaways()
+
+        if giveaway_id not in giveaways:
+            await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
+            return
+
+        data = giveaways[giveaway_id]
+
+        if not data.get("ended"):
+            await interaction.followup.send(
+                "❌ That giveaway hasn't ended yet — no winners to edit.", ephemeral=True
+            )
+            return
+
+        prize_obj = next(
+            (p for p in data["prizes"] if p["name"].lower() == prize_name.lower()), None
+        )
+        if prize_obj is None:
+            names = ", ".join(p["name"] for p in data["prizes"])
+            await interaction.followup.send(
+                f"❌ Prize tier not found. Available: {names}", ephemeral=True
+            )
+            return
+
+        winners: list[str] = list(data.get("winners", {}).get(prize_obj["name"], []))
+
+        if remove not in winners:
+            await interaction.followup.send(
+                f"❌ `{remove}` is not listed as a winner for **{prize_obj['name']}**.", ephemeral=True
+            )
+            return
+
+        winners.remove(remove)
+
+        if replace_with:
+            all_other_winners = {
+                uid
+                for pname, wlist in data["winners"].items()
+                if pname != prize_obj["name"]
+                for uid in wlist
+            }
+            if replace_with in all_other_winners:
+                await interaction.followup.send(
+                    f"❌ <@{replace_with}> already won a different prize tier.", ephemeral=True
+                )
+                return
+            winners.append(replace_with)
+            result_msg = f"✅ Replaced <@{remove}> with <@{replace_with}> in **{prize_obj['name']}**. Only you can see this."
+        else:
+            all_current_winners = {
+                uid
+                for pname, wlist in data["winners"].items()
+                if pname != prize_obj["name"]
+                for uid in wlist
+            } | set(winners)
+            pool = [
+                uid for uid in data.get("entrants", [])
+                if uid not in all_current_winners and uid != remove
+            ]
+            if pool:
+                new_uid = random.choice(pool)
+                winners.append(new_uid)
+                result_msg = (
+                    f"✅ Removed <@{remove}> from **{prize_obj['name']}** and "
+                    f"auto-drew <@{new_uid}> as replacement. Only you can see this."
+                )
+            else:
+                result_msg = (
+                    f"✅ Removed <@{remove}> from **{prize_obj['name']}**. "
+                    f"No eligible entrants left to fill the slot. Only you can see this."
+                )
+
+        data["winners"][prize_obj["name"]] = winners
+        giveaways[giveaway_id] = data
+        save_giveaways(giveaways)
+
+        await interaction.followup.send(result_msg, ephemeral=True)
+
     @giveaway.command(name="cancel", description="Cancel an active giveaway and delete the embed — no winners drawn")
     @is_mod()
     @discord.app_commands.describe(giveaway_id="The giveaway ID shown in the embed footer")
