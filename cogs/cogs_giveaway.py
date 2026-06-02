@@ -1,7 +1,6 @@
 import discord
 from discord.ext import commands
 import asyncio
-import asyncpg
 import datetime
 import json
 import os
@@ -9,8 +8,15 @@ import random
 import logging
 from utils.embed_vars import resolve_vars
 
+try:
+    import asyncpg
+    _ASYNCPG_AVAILABLE = True
+except ImportError:
+    _ASYNCPG_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
+GIVEAWAYS_FILE = "data/giveaways.json"
 OWNER_ID = 1136231768534569090
 
 
@@ -109,57 +115,93 @@ class GiveawayView(discord.ui.View):
 class GiveawayCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.pool: asyncpg.Pool | None = None
+        self.pool = None
+        self.use_db: bool = False
         self.active_tasks: dict[str, asyncio.Task] = {}
 
-    # ── DB helpers ─────────────────────────────────────────────────────────────
+    # ── Storage helpers (auto-selects Postgres or JSON file) ──────────────────
 
     async def db_init(self):
         db_url = os.environ.get("DATABASE_URL")
-        if not db_url:
-            raise RuntimeError("DATABASE_URL env var is not set — cannot start giveaway cog.")
-        self.pool = await asyncpg.create_pool(dsn=db_url)
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS giveaways (
-                    id TEXT PRIMARY KEY,
-                    data JSONB NOT NULL
-                )
-            """)
+        if db_url and _ASYNCPG_AVAILABLE:
+            try:
+                self.pool = await asyncpg.create_pool(dsn=db_url)
+                async with self.pool.acquire() as conn:
+                    await conn.execute("""
+                        CREATE TABLE IF NOT EXISTS giveaways (
+                            id TEXT PRIMARY KEY,
+                            data JSONB NOT NULL
+                        )
+                    """)
+                self.use_db = True
+                logger.info("Giveaway cog: using PostgreSQL storage")
+            except Exception as e:
+                logger.warning(f"Giveaway cog: PostgreSQL failed ({e}), falling back to JSON file")
+                self.use_db = False
+        else:
+            logger.info("Giveaway cog: DATABASE_URL not set, using JSON file storage")
+            self.use_db = False
+
+    # ── JSON file fallbacks ────────────────────────────────────────────────────
+
+    def _json_load(self) -> dict:
+        if not os.path.exists(GIVEAWAYS_FILE):
+            return {}
+        try:
+            with open(GIVEAWAYS_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def _json_save(self, data: dict):
+        os.makedirs("data", exist_ok=True)
+        with open(GIVEAWAYS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+
+    # ── Unified async API ──────────────────────────────────────────────────────
 
     async def db_get(self, giveaway_id: str) -> dict | None:
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT data FROM giveaways WHERE id = $1", giveaway_id)
-        if row is None:
-            return None
-        return dict(row["data"])
+        if self.use_db:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT data FROM giveaways WHERE id = $1", giveaway_id)
+            return dict(row["data"]) if row else None
+        return self._json_load().get(giveaway_id)
 
     async def db_all(self) -> dict[str, dict]:
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch("SELECT id, data FROM giveaways")
-        return {row["id"]: dict(row["data"]) for row in rows}
+        if self.use_db:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch("SELECT id, data FROM giveaways")
+            return {row["id"]: dict(row["data"]) for row in rows}
+        return self._json_load()
 
     async def db_all_for_guild(self, guild_id: int) -> list[dict]:
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT data FROM giveaways WHERE (data->>'guild_id')::bigint = $1", guild_id
-            )
-        return [dict(row["data"]) for row in rows]
+        all_data = await self.db_all()
+        return [d for d in all_data.values() if d.get("guild_id") == guild_id]
 
     async def db_set(self, giveaway_id: str, data: dict):
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO giveaways (id, data) VALUES ($1, $2::jsonb)
-                ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data
-                """,
-                giveaway_id,
-                json.dumps(data),
-            )
+        if self.use_db:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO giveaways (id, data) VALUES ($1, $2::jsonb)
+                    ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data
+                    """,
+                    giveaway_id,
+                    json.dumps(data),
+                )
+        else:
+            all_data = self._json_load()
+            all_data[giveaway_id] = data
+            self._json_save(all_data)
 
     async def db_delete(self, giveaway_id: str):
-        async with self.pool.acquire() as conn:
-            await conn.execute("DELETE FROM giveaways WHERE id = $1", giveaway_id)
+        if self.use_db:
+            async with self.pool.acquire() as conn:
+                await conn.execute("DELETE FROM giveaways WHERE id = $1", giveaway_id)
+        else:
+            all_data = self._json_load()
+            all_data.pop(giveaway_id, None)
+            self._json_save(all_data)
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
