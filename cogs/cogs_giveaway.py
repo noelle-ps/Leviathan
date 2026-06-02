@@ -322,10 +322,10 @@ class GiveawayCog(commands.Cog):
         embed.set_footer(text=f"{data['title']}  •  ID: {data['giveaway_id']}")
         return embed
 
-    def _build_reroll_embed(self, data: dict, prize: dict, winner_id: int) -> discord.Embed:
+    async def _build_reroll_embed(self, data: dict, prize: dict, winner_id: int) -> discord.Embed:
         embed = discord.Embed(
             title=f"🔁  Reroll — {prize['name']}",
-            color=discord.Color.blurple(),
+            color=discord.Color.gold(),
             timestamp=datetime.datetime.now(datetime.timezone.utc),
         )
         if winner_id:
@@ -334,6 +334,11 @@ class GiveawayCog(commands.Cog):
                 f"You have won **{prize['name']}** — {prize['description']} from **{data['title']}**.\n\n"
                 f"📩 Message the host for your reward!"
             )
+            try:
+                user = await self.bot.fetch_user(int(winner_id))
+                embed.set_thumbnail(url=user.display_avatar.url)
+            except Exception:
+                pass
         else:
             embed.description = "*No eligible entries for this prize.*"
         embed.set_footer(text=f"{data['title']}  •  ID: {data['giveaway_id']}")
@@ -633,10 +638,10 @@ class GiveawayCog(commands.Cog):
                 for uid in new_winners:
                     await ch.send(
                         content=f"🔁 **Reroll!**  <@{uid}>",
-                        embed=self._build_reroll_embed(data, prize_obj, uid),
+                        embed=await self._build_reroll_embed(data, prize_obj, uid),
                     )
             else:
-                await ch.send(embed=self._build_reroll_embed(data, prize_obj, 0))
+                await ch.send(embed=await self._build_reroll_embed(data, prize_obj, 0))
 
         await interaction.followup.send("✅ Reroll complete!", ephemeral=True)
 
@@ -948,6 +953,7 @@ class GiveawayCog(commands.Cog):
         prize3_name="Third prize tier name (optional)",
         prize3_description="Third prize description (optional)",
         prize3_winners="Winner IDs for prize 3, separated by spaces or commas",
+        channel="The original channel the giveaway was posted in (for reroll/announce)",
     )
     async def giveaway_restore(
         self,
@@ -963,6 +969,7 @@ class GiveawayCog(commands.Cog):
         prize3_name: str | None = None,
         prize3_description: str | None = None,
         prize3_winners: str | None = None,
+        channel: discord.TextChannel | None = None,
     ):
         await interaction.response.defer(ephemeral=True)
 
@@ -987,18 +994,12 @@ class GiveawayCog(commands.Cog):
             winners[name] = ids
             all_entrants.extend(uid for uid in ids if uid not in all_entrants)
 
-        existing = await self.db_get(giveaway_id)
-        if existing:
-            await interaction.followup.send(
-                f"❌ A giveaway with ID `{giveaway_id}` already exists. Use `/giveaway editwinner` to change winners.",
-                ephemeral=True,
-            )
-            return
+        target_channel_id = channel.id if channel else interaction.channel.id
 
         data: dict = {
             "giveaway_id": giveaway_id,
             "guild_id": interaction.guild.id,
-            "channel_id": interaction.channel.id,
+            "channel_id": target_channel_id,
             "message_id": int(giveaway_id),
             "title": title,
             "prizes": prizes,
@@ -1008,7 +1009,7 @@ class GiveawayCog(commands.Cog):
             "hosted_by_name": str(interaction.user),
             "entrants": all_entrants,
             "ended": True,
-            "announced": True,
+            "announced": False,
             "winners": winners,
             "footer_text": None,
             "footer_icon": None,
