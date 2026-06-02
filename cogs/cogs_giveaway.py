@@ -1,6 +1,7 @@
 import discord
 from discord.ext import commands
 import asyncio
+import asyncpg
 import datetime
 import json
 import os
@@ -10,7 +11,6 @@ from utils.embed_vars import resolve_vars
 
 logger = logging.getLogger(__name__)
 
-GIVEAWAYS_FILE = "data/giveaways.json"
 OWNER_ID = 1136231768534569090
 
 
@@ -39,23 +39,7 @@ def parse_duration(duration: str) -> datetime.timedelta | None:
     return datetime.timedelta(seconds=value * units[unit])
 
 
-def load_giveaways() -> dict:
-    if not os.path.exists(GIVEAWAYS_FILE):
-        return {}
-    try:
-        with open(GIVEAWAYS_FILE, "r") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def save_giveaways(data: dict):
-    os.makedirs("data", exist_ok=True)
-    with open(GIVEAWAYS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-def _apply_vars(text: str | None, guild: discord.Guild | None, user: discord.Member | discord.User | None) -> str | None:
+def _apply_vars(text: str | None, guild, user) -> str | None:
     if not text:
         return text
     return resolve_vars(text, guild, user)
@@ -74,14 +58,15 @@ class GiveawayEntryButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        giveaways = load_giveaways()
         giveaway_id = self.custom_id.split(":", 1)[1]
-        data = giveaways.get(giveaway_id)
+        cog: GiveawayCog | None = interaction.client.cogs.get("GiveawayCog")  # type: ignore
+        if cog is None:
+            await interaction.response.send_message("❌ Giveaway system unavailable.", ephemeral=True)
+            return
 
+        data = await cog.db_get(giveaway_id)
         if not data or data.get("ended"):
-            await interaction.response.send_message(
-                "❌ This giveaway has already ended.", ephemeral=True
-            )
+            await interaction.response.send_message("❌ This giveaway has already ended.", ephemeral=True)
             return
 
         required_role_id = data.get("required_role")
@@ -89,8 +74,7 @@ class GiveawayEntryButton(discord.ui.Button):
             member = interaction.guild.get_member(interaction.user.id)
             if not member or not any(r.id == required_role_id for r in member.roles):
                 await interaction.response.send_message(
-                    f"❌ You need <@&{required_role_id}> to enter this giveaway.",
-                    ephemeral=True,
+                    f"❌ You need <@&{required_role_id}> to enter this giveaway.", ephemeral=True
                 )
                 return
 
@@ -105,12 +89,10 @@ class GiveawayEntryButton(discord.ui.Button):
             msg = "🎉 You've entered! Good luck!"
 
         data["entrants"] = entrants
-        giveaways[giveaway_id] = data
-        save_giveaways(giveaways)
+        await cog.db_set(giveaway_id, data)
 
         try:
-            updated_embed = GiveawayCog._static_build_active_embed(data)
-            await interaction.response.edit_message(embed=updated_embed)
+            await interaction.response.edit_message(embed=GiveawayCog._static_build_active_embed(data))
             await interaction.followup.send(msg, ephemeral=True)
         except Exception:
             await interaction.response.send_message(msg, ephemeral=True)
@@ -127,12 +109,65 @@ class GiveawayView(discord.ui.View):
 class GiveawayCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.pool: asyncpg.Pool | None = None
         self.active_tasks: dict[str, asyncio.Task] = {}
 
+    # ── DB helpers ─────────────────────────────────────────────────────────────
+
+    async def db_init(self):
+        db_url = os.environ.get("DATABASE_URL")
+        if not db_url:
+            raise RuntimeError("DATABASE_URL env var is not set — cannot start giveaway cog.")
+        self.pool = await asyncpg.create_pool(dsn=db_url)
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS giveaways (
+                    id TEXT PRIMARY KEY,
+                    data JSONB NOT NULL
+                )
+            """)
+
+    async def db_get(self, giveaway_id: str) -> dict | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT data FROM giveaways WHERE id = $1", giveaway_id)
+        if row is None:
+            return None
+        return dict(row["data"])
+
+    async def db_all(self) -> dict[str, dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT id, data FROM giveaways")
+        return {row["id"]: dict(row["data"]) for row in rows}
+
+    async def db_all_for_guild(self, guild_id: int) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT data FROM giveaways WHERE (data->>'guild_id')::bigint = $1", guild_id
+            )
+        return [dict(row["data"]) for row in rows]
+
+    async def db_set(self, giveaway_id: str, data: dict):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO giveaways (id, data) VALUES ($1, $2::jsonb)
+                ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data
+                """,
+                giveaway_id,
+                json.dumps(data),
+            )
+
+    async def db_delete(self, giveaway_id: str):
+        async with self.pool.acquire() as conn:
+            await conn.execute("DELETE FROM giveaways WHERE id = $1", giveaway_id)
+
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
+
     async def cog_load(self):
-        giveaways = load_giveaways()
+        await self.db_init()
+        all_giveaways = await self.db_all()
         now = datetime.datetime.now(datetime.timezone.utc).timestamp()
-        for gid, data in list(giveaways.items()):
+        for gid, data in all_giveaways.items():
             mid = data.get("message_id")
             if not data.get("ended"):
                 self.bot.add_view(GiveawayView(gid), message_id=mid)
@@ -142,6 +177,12 @@ class GiveawayCog(commands.Cog):
                 )
             else:
                 self.bot.add_view(GiveawayView(gid, disabled=True), message_id=mid)
+
+    async def cog_unload(self):
+        for task in self.active_tasks.values():
+            task.cancel()
+        if self.pool:
+            await self.pool.close()
 
     # ── Embed builders ─────────────────────────────────────────────────────────
 
@@ -169,13 +210,8 @@ class GiveawayCog(commands.Cog):
             inline=True,
         )
         if data.get("required_role"):
-            embed.add_field(
-                name="🔒 Required role",
-                value=f"<@&{data['required_role']}>",
-                inline=True,
-            )
+            embed.add_field(name="🔒 Required role", value=f"<@&{data['required_role']}>", inline=True)
 
-        # Custom footer — stored as already-resolved strings
         footer_text = data.get("footer_text") or f"Click the button to enter  •  ID: {data['giveaway_id']}"
         footer_icon = data.get("footer_icon") or None
         if footer_icon:
@@ -183,7 +219,6 @@ class GiveawayCog(commands.Cog):
         else:
             embed.set_footer(text=footer_text)
 
-        # Custom image
         if data.get("image"):
             embed.set_image(url=data["image"])
 
@@ -216,10 +251,7 @@ class GiveawayCog(commands.Cog):
         embed.timestamp = datetime.datetime.fromtimestamp(end_time, tz=datetime.timezone.utc)
         return embed
 
-    async def _build_winner_announce_embed(
-        self, data: dict, prize: dict, winner_id: str
-    ) -> discord.Embed:
-        """One embed per individual winner, with their own avatar as thumbnail."""
+    async def _build_winner_announce_embed(self, data: dict, prize: dict, winner_id: str) -> discord.Embed:
         embed = discord.Embed(
             color=discord.Color.gold(),
             timestamp=datetime.datetime.now(datetime.timezone.utc),
@@ -227,7 +259,7 @@ class GiveawayCog(commands.Cog):
         embed.title = f"🏆  {prize['name']}"
         embed.description = (
             f"🎉 **Congratulations, <@{winner_id}>!**\n\n"
-            f"You have won **{prize['description']}** from **{data['title']}**.\n\n"
+            f"You have won **{prize['name']}** — {prize['description']} from **{data['title']}**.\n\n"
             f"📩 Message the host for your reward!"
         )
         try:
@@ -247,7 +279,7 @@ class GiveawayCog(commands.Cog):
         if winner_id:
             embed.description = (
                 f"🎉 **Congratulations, <@{winner_id}>!**\n\n"
-                f"You have won **{prize['description']}** from **{data['title']}**.\n\n"
+                f"You have won **{prize['name']}** — {prize['description']} from **{data['title']}**.\n\n"
                 f"📩 Message the host for your reward!"
             )
         else:
@@ -261,8 +293,7 @@ class GiveawayCog(commands.Cog):
         if delay > 0:
             await asyncio.sleep(delay)
 
-        giveaways = load_giveaways()
-        data = giveaways.get(giveaway_id)
+        data = await self.db_get(giveaway_id)
         if not data or data.get("ended"):
             return
 
@@ -293,8 +324,7 @@ class GiveawayCog(commands.Cog):
         data["ended"] = True
         data["announced"] = False
         data["winners"] = winners_by_prize
-        giveaways[giveaway_id] = data
-        save_giveaways(giveaways)
+        await self.db_set(giveaway_id, data)
         self.active_tasks.pop(giveaway_id, None)
 
     # ── Slash command group ────────────────────────────────────────────────────
@@ -349,9 +379,7 @@ class GiveawayCog(commands.Cog):
 
         delta = parse_duration(duration)
         if delta is None:
-            await interaction.followup.send(
-                "❌ Invalid duration. Use formats like `30s`, `10m`, `2h`, `1d`.", ephemeral=True
-            )
+            await interaction.followup.send("❌ Invalid duration. Use formats like `30s`, `10m`, `2h`, `1d`.", ephemeral=True)
             return
 
         target: discord.TextChannel
@@ -363,18 +391,11 @@ class GiveawayCog(commands.Cog):
             await interaction.followup.send("❌ Use this command in a text channel.", ephemeral=True)
             return
 
-        prizes = [
-            {"name": prize1_name, "description": prize1_description, "quantity": max(1, prize1_quantity)}
-        ]
+        prizes = [{"name": prize1_name, "description": prize1_description, "quantity": max(1, prize1_quantity)}]
         if prize2_name and prize2_description:
             prizes.append({"name": prize2_name, "description": prize2_description, "quantity": max(1, prize2_quantity)})
         if prize3_name and prize3_description:
             prizes.append({"name": prize3_name, "description": prize3_description, "quantity": max(1, prize3_quantity)})
-
-        # Resolve {} variables at creation time using the command user's context
-        resolved_footer_text = _apply_vars(footer_text, interaction.guild, interaction.user)
-        resolved_footer_icon = _apply_vars(footer_icon, interaction.guild, interaction.user)
-        resolved_image = _apply_vars(image, interaction.guild, interaction.user)
 
         end_time = (datetime.datetime.now(datetime.timezone.utc) + delta).timestamp()
         data: dict = {
@@ -392,9 +413,9 @@ class GiveawayCog(commands.Cog):
             "ended": False,
             "announced": False,
             "winners": {},
-            "footer_text": resolved_footer_text,
-            "footer_icon": resolved_footer_icon,
-            "image": resolved_image,
+            "footer_text": _apply_vars(footer_text, interaction.guild, interaction.user),
+            "footer_icon": _apply_vars(footer_icon, interaction.guild, interaction.user),
+            "image": _apply_vars(image, interaction.guild, interaction.user),
         }
 
         message = await target.send(embed=self._static_build_active_embed(data))
@@ -406,29 +427,25 @@ class GiveawayCog(commands.Cog):
         await message.edit(embed=self._static_build_active_embed(data), view=view)
         self.bot.add_view(view, message_id=message.id)
 
-        giveaways = load_giveaways()
-        giveaways[giveaway_id] = data
-        save_giveaways(giveaways)
+        await self.db_set(giveaway_id, data)
 
         self.active_tasks[giveaway_id] = asyncio.create_task(
             self._end_giveaway(giveaway_id, delay=delta.total_seconds())
         )
 
-        await interaction.followup.send(
-            f"✅ Giveaway **{title}** started in {target.mention}!", ephemeral=True
-        )
+        await interaction.followup.send(f"✅ Giveaway **{title}** started in {target.mention}!", ephemeral=True)
 
     @giveaway.command(name="end", description="End a giveaway early and draw winners now")
     @is_mod()
     @discord.app_commands.describe(giveaway_id="The giveaway ID shown in the embed footer")
     async def giveaway_end(self, interaction: discord.Interaction, giveaway_id: str):
         await interaction.response.defer(ephemeral=True)
-        giveaways = load_giveaways()
+        data = await self.db_get(giveaway_id)
 
-        if giveaway_id not in giveaways:
+        if not data:
             await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
             return
-        if giveaways[giveaway_id].get("ended"):
+        if data.get("ended"):
             await interaction.followup.send("❌ That giveaway has already ended.", ephemeral=True)
             return
 
@@ -437,60 +454,43 @@ class GiveawayCog(commands.Cog):
             task.cancel()
 
         await self._end_giveaway(giveaway_id, delay=0)
-        await interaction.followup.send(
-            "✅ Giveaway ended! Use `/giveaway announce` whenever you're ready.", ephemeral=True
-        )
+        await interaction.followup.send("✅ Giveaway ended! Use `/giveaway announce` whenever you're ready.", ephemeral=True)
 
-    @giveaway.command(
-        name="announce",
-        description="Dramatically reveal winners — pings @everyone then reveals each prize tier",
-    )
+    @giveaway.command(name="announce", description="Dramatically reveal winners one by one with 5s intervals")
     @is_mod()
     @discord.app_commands.describe(giveaway_id="The giveaway ID shown in the embed footer")
     async def giveaway_announce(self, interaction: discord.Interaction, giveaway_id: str):
         await interaction.response.defer(ephemeral=True)
-        giveaways = load_giveaways()
+        data = await self.db_get(giveaway_id)
 
-        if giveaway_id not in giveaways:
+        if not data:
             await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
             return
-
-        data = giveaways[giveaway_id]
-
         if not data.get("ended"):
-            await interaction.followup.send(
-                "❌ That giveaway hasn't ended yet. Use `/giveaway end` first.", ephemeral=True
-            )
+            await interaction.followup.send("❌ That giveaway hasn't ended yet. Use `/giveaway end` first.", ephemeral=True)
             return
         if data.get("announced"):
-            await interaction.followup.send(
-                "❌ Winners have already been announced. Use `/giveaway reroll` if needed.",
-                ephemeral=True,
-            )
+            await interaction.followup.send("❌ Winners have already been announced. Use `/giveaway reroll` if needed.", ephemeral=True)
             return
 
         channel = interaction.guild.get_channel(data["channel_id"])
         if not channel or not isinstance(channel, discord.TextChannel):
-            await interaction.followup.send(
-                "❌ The original giveaway channel no longer exists.", ephemeral=True
-            )
+            await interaction.followup.send("❌ The original giveaway channel no longer exists.", ephemeral=True)
             return
 
         winners = data.get("winners", {})
 
-        # Hype ping
         await channel.send(
             "🎊 **@everyone — Giveaway winners are about to be announced!** 🥁 Get ready...",
             allowed_mentions=discord.AllowedMentions(everyone=True),
         )
-
         await asyncio.sleep(5)
 
-        # Build flat list of (prize, winner_id) — one entry per individual winner
-        all_winners: list[tuple[dict, str]] = []
-        for prize in data["prizes"]:
-            for uid in winners.get(prize["name"], []):
-                all_winners.append((prize, uid))
+        all_winners: list[tuple[dict, str]] = [
+            (prize, uid)
+            for prize in data["prizes"]
+            for uid in winners.get(prize["name"], [])
+        ]
 
         if not all_winners:
             await channel.send("*No eligible entries were found for this giveaway.*")
@@ -502,9 +502,7 @@ class GiveawayCog(commands.Cog):
                     await asyncio.sleep(5)
 
         data["announced"] = True
-        giveaways[giveaway_id] = data
-        save_giveaways(giveaways)
-
+        await self.db_set(giveaway_id, data)
         await interaction.followup.send("✅ Winners announced!", ephemeral=True)
 
     @giveaway.command(name="winners", description="Quietly look up the winners of any past giveaway")
@@ -512,18 +510,13 @@ class GiveawayCog(commands.Cog):
     @discord.app_commands.describe(giveaway_id="The giveaway ID shown in the embed footer")
     async def giveaway_winners(self, interaction: discord.Interaction, giveaway_id: str):
         await interaction.response.defer(ephemeral=True)
-        giveaways = load_giveaways()
+        data = await self.db_get(giveaway_id)
 
-        if giveaway_id not in giveaways:
+        if not data:
             await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
             return
-
-        data = giveaways[giveaway_id]
-
         if not data.get("ended"):
-            await interaction.followup.send(
-                "❌ That giveaway hasn't ended yet — no winners drawn yet.", ephemeral=True
-            )
+            await interaction.followup.send("❌ That giveaway hasn't ended yet.", ephemeral=True)
             return
 
         winners = data.get("winners", {})
@@ -532,25 +525,16 @@ class GiveawayCog(commands.Cog):
             color=discord.Color.gold(),
             timestamp=datetime.datetime.now(datetime.timezone.utc),
         )
-
         for prize in data["prizes"]:
             prize_winners = winners.get(prize["name"], [])
-            if prize_winners:
-                value = "\n".join(f"<@{uid}> (`{uid}`)" for uid in prize_winners)
-            else:
-                value = "*No eligible entries*"
-            embed.add_field(
-                name=f"{prize['name']} — {prize['description']}",
-                value=value,
-                inline=False,
-            )
+            value = "\n".join(f"<@{uid}> (`{uid}`)" for uid in prize_winners) if prize_winners else "*No eligible entries*"
+            embed.add_field(name=f"{prize['name']} — {prize['description']}", value=value, inline=False)
 
         end_time = int(data["end_time"])
         embed.add_field(name="Ended", value=f"<t:{end_time}:f>", inline=True)
         embed.add_field(name="Total entries", value=str(len(data.get("entrants", []))), inline=True)
         embed.add_field(name="Announced", value="✅ Yes" if data.get("announced") else "⏳ Not yet", inline=True)
         embed.set_footer(text=f"Giveaway ID: {giveaway_id}  •  Only visible to you")
-
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @giveaway.command(name="reroll", description="Reroll winners for a specific prize tier")
@@ -559,33 +543,25 @@ class GiveawayCog(commands.Cog):
         giveaway_id="The giveaway ID shown in the embed footer",
         prize_name="Prize tier to reroll (e.g. Gold, Silver)",
     )
-    async def giveaway_reroll(
-        self, interaction: discord.Interaction, giveaway_id: str, prize_name: str
-    ):
+    async def giveaway_reroll(self, interaction: discord.Interaction, giveaway_id: str, prize_name: str):
         await interaction.response.defer(ephemeral=True)
-        giveaways = load_giveaways()
+        data = await self.db_get(giveaway_id)
 
-        if giveaway_id not in giveaways:
+        if not data:
             await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
             return
-
-        data = giveaways[giveaway_id]
         if not data.get("ended"):
             await interaction.followup.send("❌ That giveaway hasn't ended yet.", ephemeral=True)
             return
 
-        prize_obj = next(
-            (p for p in data["prizes"] if p["name"].lower() == prize_name.lower()), None
-        )
+        prize_obj = next((p for p in data["prizes"] if p["name"].lower() == prize_name.lower()), None)
         if prize_obj is None:
             names = ", ".join(p["name"] for p in data["prizes"])
-            await interaction.followup.send(
-                f"❌ Prize tier not found. Available: {names}", ephemeral=True
-            )
+            await interaction.followup.send(f"❌ Prize tier not found. Available: {names}", ephemeral=True)
             return
 
         entrants = [int(uid) for uid in data.get("entrants", [])]
-        excluded: set[int] = {
+        excluded = {
             int(uid)
             for pname, wlist in data["winners"].items()
             if pname.lower() != prize_name.lower()
@@ -596,8 +572,7 @@ class GiveawayCog(commands.Cog):
         new_winners = random.sample(pool, qty) if qty > 0 else []
 
         data["winners"][prize_obj["name"]] = [str(uid) for uid in new_winners]
-        giveaways[giveaway_id] = data
-        save_giveaways(giveaways)
+        await self.db_set(giveaway_id, data)
 
         guild = self.bot.get_guild(data["guild_id"])
         ch = guild.get_channel(data["channel_id"]) if guild else None
@@ -613,30 +588,22 @@ class GiveawayCog(commands.Cog):
 
         await interaction.followup.send("✅ Reroll complete!", ephemeral=True)
 
-    @giveaway.command(name="dm", description="DM every winner of a giveaway to contact the host for their reward")
+    @giveaway.command(name="dm", description="DM every winner to contact the host for their reward")
     @is_mod()
     @discord.app_commands.describe(giveaway_id="The giveaway ID shown in the embed footer")
     async def giveaway_dm(self, interaction: discord.Interaction, giveaway_id: str):
         await interaction.response.defer(ephemeral=True)
-        giveaways = load_giveaways()
+        data = await self.db_get(giveaway_id)
 
-        if giveaway_id not in giveaways:
+        if not data:
             await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
             return
-
-        data = giveaways[giveaway_id]
-
         if not data.get("ended"):
-            await interaction.followup.send(
-                "❌ That giveaway hasn't ended yet — no winners drawn yet.", ephemeral=True
-            )
+            await interaction.followup.send("❌ That giveaway hasn't ended yet.", ephemeral=True)
             return
 
         winners = data.get("winners", {})
-        all_winner_ids: list[tuple[dict, str]] = []
-        for prize in data["prizes"]:
-            for uid in winners.get(prize["name"], []):
-                all_winner_ids.append((prize, uid))
+        all_winner_ids = [(prize, uid) for prize in data["prizes"] for uid in winners.get(prize["name"], [])]
 
         if not all_winner_ids:
             await interaction.followup.send("❌ No winners found for this giveaway.", ephemeral=True)
@@ -686,82 +653,47 @@ class GiveawayCog(commands.Cog):
         replace_with: str | None = None,
     ):
         await interaction.response.defer(ephemeral=True)
-        giveaways = load_giveaways()
+        data = await self.db_get(giveaway_id)
 
-        if giveaway_id not in giveaways:
+        if not data:
             await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
             return
-
-        data = giveaways[giveaway_id]
-
         if not data.get("ended"):
-            await interaction.followup.send(
-                "❌ That giveaway hasn't ended yet — no winners to edit.", ephemeral=True
-            )
+            await interaction.followup.send("❌ That giveaway hasn't ended yet.", ephemeral=True)
             return
 
-        prize_obj = next(
-            (p for p in data["prizes"] if p["name"].lower() == prize_name.lower()), None
-        )
+        prize_obj = next((p for p in data["prizes"] if p["name"].lower() == prize_name.lower()), None)
         if prize_obj is None:
             names = ", ".join(p["name"] for p in data["prizes"])
-            await interaction.followup.send(
-                f"❌ Prize tier not found. Available: {names}", ephemeral=True
-            )
+            await interaction.followup.send(f"❌ Prize tier not found. Available: {names}", ephemeral=True)
             return
 
         winners: list[str] = list(data.get("winners", {}).get(prize_obj["name"], []))
-
         if remove not in winners:
-            await interaction.followup.send(
-                f"❌ `{remove}` is not listed as a winner for **{prize_obj['name']}**.", ephemeral=True
-            )
+            await interaction.followup.send(f"❌ `{remove}` is not listed as a winner for **{prize_obj['name']}**.", ephemeral=True)
             return
 
         winners.remove(remove)
 
         if replace_with:
-            all_other_winners = {
-                uid
-                for pname, wlist in data["winners"].items()
-                if pname != prize_obj["name"]
-                for uid in wlist
-            }
+            all_other_winners = {uid for pname, wlist in data["winners"].items() if pname != prize_obj["name"] for uid in wlist}
             if replace_with in all_other_winners:
-                await interaction.followup.send(
-                    f"❌ <@{replace_with}> already won a different prize tier.", ephemeral=True
-                )
+                await interaction.followup.send(f"❌ <@{replace_with}> already won a different prize tier.", ephemeral=True)
                 return
             winners.append(replace_with)
             result_msg = f"✅ Replaced <@{remove}> with <@{replace_with}> in **{prize_obj['name']}**. Only you can see this."
         else:
-            all_current_winners = {
-                uid
-                for pname, wlist in data["winners"].items()
-                if pname != prize_obj["name"]
-                for uid in wlist
-            } | set(winners)
-            pool = [
-                uid for uid in data.get("entrants", [])
-                if uid not in all_current_winners and uid != remove
-            ]
+            all_current_winners = {uid for pname, wlist in data["winners"].items() if pname != prize_obj["name"] for uid in wlist} | set(winners)
+            pool = [uid for uid in data.get("entrants", []) if uid not in all_current_winners and uid != remove]
             if pool:
                 new_uid = random.choice(pool)
                 winners.append(new_uid)
-                result_msg = (
-                    f"✅ Removed <@{remove}> from **{prize_obj['name']}** and "
-                    f"auto-drew <@{new_uid}> as replacement. Only you can see this."
-                )
+                result_msg = f"✅ Removed <@{remove}> from **{prize_obj['name']}** and auto-drew <@{new_uid}> as replacement. Only you can see this."
             else:
-                result_msg = (
-                    f"✅ Removed <@{remove}> from **{prize_obj['name']}**. "
-                    f"No eligible entrants left to fill the slot. Only you can see this."
-                )
+                result_msg = f"✅ Removed <@{remove}> from **{prize_obj['name']}**. No eligible entrants left to fill the slot. Only you can see this."
 
         data["winners"][prize_obj["name"]] = winners
-        giveaways[giveaway_id] = data
-        save_giveaways(giveaways)
-
+        await self.db_set(giveaway_id, data)
         await interaction.followup.send(result_msg, ephemeral=True)
 
     @giveaway.command(name="cancel", description="Cancel an active giveaway and delete the embed — no winners drawn")
@@ -769,26 +701,19 @@ class GiveawayCog(commands.Cog):
     @discord.app_commands.describe(giveaway_id="The giveaway ID shown in the embed footer")
     async def giveaway_cancel(self, interaction: discord.Interaction, giveaway_id: str):
         await interaction.response.defer(ephemeral=True)
-        giveaways = load_giveaways()
+        data = await self.db_get(giveaway_id)
 
-        if giveaway_id not in giveaways:
+        if not data:
             await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
             return
-
-        data = giveaways[giveaway_id]
-
         if data.get("ended"):
-            await interaction.followup.send(
-                "❌ That giveaway has already ended. Use `/giveaway reroll` if needed.", ephemeral=True
-            )
+            await interaction.followup.send("❌ That giveaway has already ended.", ephemeral=True)
             return
 
-        # Cancel the auto-end task
         task = self.active_tasks.pop(giveaway_id, None)
         if task:
             task.cancel()
 
-        # Delete the embed message
         guild = self.bot.get_guild(data["guild_id"])
         channel = guild.get_channel(data["channel_id"]) if guild else None
         if channel and isinstance(channel, discord.TextChannel):
@@ -798,12 +723,8 @@ class GiveawayCog(commands.Cog):
             except (discord.NotFound, discord.HTTPException):
                 pass
 
-        del giveaways[giveaway_id]
-        save_giveaways(giveaways)
-
-        await interaction.followup.send(
-            f"✅ Giveaway **{data['title']}** has been cancelled and the embed deleted.", ephemeral=True
-        )
+        await self.db_delete(giveaway_id)
+        await interaction.followup.send(f"✅ Giveaway **{data['title']}** has been cancelled and the embed deleted.", ephemeral=True)
 
     @giveaway.command(name="edit", description="Edit an active giveaway's title, end time, or prizes")
     @is_mod()
@@ -838,18 +759,13 @@ class GiveawayCog(commands.Cog):
         image: str | None = None,
     ):
         await interaction.response.defer(ephemeral=True)
-        giveaways = load_giveaways()
+        data = await self.db_get(giveaway_id)
 
-        if giveaway_id not in giveaways:
+        if not data:
             await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
             return
-
-        data = giveaways[giveaway_id]
-
         if data.get("ended"):
-            await interaction.followup.send(
-                "❌ That giveaway has already ended and can't be edited.", ephemeral=True
-            )
+            await interaction.followup.send("❌ That giveaway has already ended and can't be edited.", ephemeral=True)
             return
 
         changes: list[str] = []
@@ -861,15 +777,11 @@ class GiveawayCog(commands.Cog):
         if extend:
             delta = parse_duration(extend)
             if delta is None:
-                await interaction.followup.send(
-                    "❌ Invalid duration for extend. Use e.g. `30m`, `2h`, `1d`.", ephemeral=True
-                )
+                await interaction.followup.send("❌ Invalid duration. Use e.g. `30m`, `2h`, `1d`.", ephemeral=True)
                 return
             data["end_time"] = data["end_time"] + delta.total_seconds()
             end_ts = int(data["end_time"])
             changes.append(f"end time extended → <t:{end_ts}:f>")
-
-            # Reschedule the auto-end task
             old_task = self.active_tasks.pop(giveaway_id, None)
             if old_task:
                 old_task.cancel()
@@ -879,18 +791,12 @@ class GiveawayCog(commands.Cog):
                 self._end_giveaway(giveaway_id, delay=new_delay)
             )
 
-        prize_edits = [
-            (0, prize1_name, prize1_description),
-            (1, prize2_name, prize2_description),
-            (2, prize3_name, prize3_description),
-        ]
-        for idx, new_name, new_desc in prize_edits:
+        for idx, (new_name, new_desc) in enumerate([(prize1_name, prize1_description), (prize2_name, prize2_description), (prize3_name, prize3_description)]):
             if idx >= len(data["prizes"]):
                 break
             if new_name:
                 old = data["prizes"][idx]["name"]
                 data["prizes"][idx]["name"] = new_name
-                # Keep winners dict in sync if it exists
                 if old in data.get("winners", {}):
                     data["winners"][new_name] = data["winners"].pop(old)
                 changes.append(f"prize {idx + 1} name → **{new_name}**")
@@ -912,10 +818,8 @@ class GiveawayCog(commands.Cog):
             await interaction.followup.send("Nothing to update — provide at least one field.", ephemeral=True)
             return
 
-        giveaways[giveaway_id] = data
-        save_giveaways(giveaways)
+        await self.db_set(giveaway_id, data)
 
-        # Refresh the live embed in the channel
         guild = self.bot.get_guild(data["guild_id"])
         channel = guild.get_channel(data["channel_id"]) if guild else None
         if channel and isinstance(channel, discord.TextChannel):
@@ -926,9 +830,7 @@ class GiveawayCog(commands.Cog):
                 pass
 
         summary = "\n".join(f"• {c}" for c in changes)
-        await interaction.followup.send(
-            f"✅ Giveaway updated:\n{summary}", ephemeral=True
-        )
+        await interaction.followup.send(f"✅ Giveaway updated:\n{summary}", ephemeral=True)
 
     @giveaway.command(name="entrants", description="See everyone who entered a giveaway — ephemeral")
     @is_mod()
@@ -936,32 +838,21 @@ class GiveawayCog(commands.Cog):
         giveaway_id="The giveaway ID shown in the embed footer",
         search="Check if a specific user ID is in the pool",
     )
-    async def giveaway_entrants(
-        self,
-        interaction: discord.Interaction,
-        giveaway_id: str,
-        search: str | None = None,
-    ):
+    async def giveaway_entrants(self, interaction: discord.Interaction, giveaway_id: str, search: str | None = None):
         await interaction.response.defer(ephemeral=True)
-        giveaways = load_giveaways()
+        data = await self.db_get(giveaway_id)
 
-        if giveaway_id not in giveaways:
+        if not data:
             await interaction.followup.send("❌ Giveaway not found.", ephemeral=True)
             return
 
-        data = giveaways[giveaway_id]
         entrants: list[str] = data.get("entrants", [])
 
-        # Search mode — just check if one person is in
         if search:
             if search in entrants:
-                await interaction.followup.send(
-                    f"✅ `{search}` (<@{search}>) **is** in the entrant pool.", ephemeral=True
-                )
+                await interaction.followup.send(f"✅ `{search}` (<@{search}>) **is** in the entrant pool.", ephemeral=True)
             else:
-                await interaction.followup.send(
-                    f"❌ `{search}` is **not** in the entrant pool.", ephemeral=True
-                )
+                await interaction.followup.send(f"❌ `{search}` is **not** in the entrant pool.", ephemeral=True)
             return
 
         total = len(entrants)
@@ -969,12 +860,9 @@ class GiveawayCog(commands.Cog):
             await interaction.followup.send("No one has entered this giveaway yet.", ephemeral=True)
             return
 
-        # Split into pages of 50 mentions to stay under Discord's 4096 char embed limit
-        page_size = 50
         pages: list[str] = []
-        for i in range(0, total, page_size):
-            chunk = entrants[i : i + page_size]
-            pages.append(" ".join(f"<@{uid}>" for uid in chunk))
+        for i in range(0, total, 50):
+            pages.append(" ".join(f"<@{uid}>" for uid in entrants[i:i + 50]))
 
         embed = discord.Embed(
             title=f"👥  Entrants — {data['title']}",
@@ -989,12 +877,8 @@ class GiveawayCog(commands.Cog):
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-        # Send overflow pages as follow-up embeds (still ephemeral)
         for idx, page in enumerate(pages[1:], start=2):
-            overflow = discord.Embed(
-                description=page,
-                color=discord.Color.blurple(),
-            )
+            overflow = discord.Embed(description=page, color=discord.Color.blurple())
             overflow.set_footer(text=f"Page {idx}/{len(pages)}  •  ID: {giveaway_id}")
             await interaction.followup.send(embed=overflow, ephemeral=True)
 
@@ -1005,11 +889,8 @@ class GiveawayCog(commands.Cog):
             await interaction.response.send_message("❌ Server only.", ephemeral=True)
             return
 
-        giveaways = load_giveaways()
-        active = [
-            d for d in giveaways.values()
-            if not d.get("ended") and d["guild_id"] == interaction.guild.id
-        ]
+        all_data = await self.db_all_for_guild(interaction.guild.id)
+        active = [d for d in all_data if not d.get("ended")]
 
         if not active:
             await interaction.response.send_message("No active giveaways right now.", ephemeral=True)
@@ -1034,14 +915,9 @@ class GiveawayCog(commands.Cog):
                 ),
                 inline=False,
             )
-
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    async def cog_app_command_error(
-        self,
-        interaction: discord.Interaction,
-        error: discord.app_commands.AppCommandError,
-    ):
+    async def cog_app_command_error(self, interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
         msg = (
             "❌ You don't have permission to use this command."
             if isinstance(error, discord.app_commands.CheckFailure)
