@@ -125,6 +125,9 @@ class GiveawayCog(commands.Cog):
         db_url = os.environ.get("DATABASE_URL")
         if db_url and _ASYNCPG_AVAILABLE:
             try:
+                # Railway gives postgres:// but asyncpg needs postgresql://
+                if db_url.startswith("postgres://"):
+                    db_url = db_url.replace("postgres://", "postgresql://", 1)
                 self.pool = await asyncpg.create_pool(dsn=db_url)
                 async with self.pool.acquire() as conn:
                     await conn.execute("""
