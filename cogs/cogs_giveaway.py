@@ -163,18 +163,25 @@ class GiveawayCog(commands.Cog):
 
     # ── Unified async API ──────────────────────────────────────────────────────
 
+    def _parse_row(self, value) -> dict:
+        if isinstance(value, str):
+            return json.loads(value)
+        if isinstance(value, dict):
+            return value
+        return dict(value)
+
     async def db_get(self, giveaway_id: str) -> dict | None:
         if self.use_db:
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow("SELECT data FROM giveaways WHERE id = $1", giveaway_id)
-            return dict(row["data"]) if row else None
+            return self._parse_row(row["data"]) if row else None
         return self._json_load().get(giveaway_id)
 
     async def db_all(self) -> dict[str, dict]:
         if self.use_db:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch("SELECT id, data FROM giveaways")
-            return {row["id"]: dict(row["data"]) for row in rows}
+            return {row["id"]: self._parse_row(row["data"]) for row in rows}
         return self._json_load()
 
     async def db_all_for_guild(self, guild_id: int) -> list[dict]:
